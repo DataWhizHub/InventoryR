@@ -7,13 +7,10 @@ Monthly cycle
   3. Read the report: Opening + Purchases - Closing = SOLD (qty and value)
   4. Next month's Opening stock = this month's Closing stock (automatic)
 
-Storage: Google Sheets when st.secrets has [gcp_service_account] + sheet_id,
-otherwise local CSV files in ./data (fine for testing, NOT persistent on Streamlit Cloud).
+Storage: Google Sheets ONLY (no local files). Tabs items / purchases / counts / openings / users
+are created automatically in the Sheet.
 
-.streamlit/secrets.toml  (or the "Secrets" box on Streamlit Cloud):
-    sheet_id = "<the long id in your Google Sheet URL>"
-    registration_code = "optional-code-needed-to-register"      # optional
-
+Streamlit secrets (.streamlit/secrets.toml, or the "Secrets" box on Streamlit Cloud):
     [gcp_service_account]
     type = "service_account"
     project_id = "..."
@@ -22,7 +19,9 @@ otherwise local CSV files in ./data (fine for testing, NOT persistent on Streaml
     client_email = "...@...iam.gserviceaccount.com"
     client_id = "..."
     token_uri = "https://oauth2.googleapis.com/token"
-Then share the Google Sheet with client_email as EDITOR. The tabs are created automatically.
+    # sheet_id = "..."           <- optional, overrides SHEET_ID below
+    # registration_code = "..."  <- optional, required to register
+The Google Sheet must be shared with client_email as EDITOR.
 """
 import hashlib
 import hmac
@@ -38,7 +37,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Restaurant Inventory", page_icon="🍽️", layout="wide")
 
-DATA_DIR = os.environ.get("INVENTORY_DATA_DIR", "data")
+# Your Google Sheet (the long id in its URL). Not a secret, but the service-account key IS - keep it in st.secrets.
+SHEET_ID = "12KVW70mON33I_51l8hlYCmQaarxGdqcOAtCjIVp8Gr4"
 
 SCHEMA = {
     "items": {"item": "str", "group": "str", "size": "str", "category": "str", "unit": "str",
@@ -77,20 +77,6 @@ def clean(table, df):
 
 
 # ───────────────────────────── storage ─────────────────────────────
-class LocalStore:
-    label = "Local CSV files (data/ folder)"
-
-    def read(self, t):
-        p = os.path.join(DATA_DIR, f"{t}.csv")
-        if os.path.exists(p):
-            return pd.read_csv(p, dtype=str, keep_default_na=False)
-        return pd.DataFrame(columns=list(SCHEMA[t]))
-
-    def write(self, t, df):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        df.to_csv(os.path.join(DATA_DIR, f"{t}.csv"), index=False)
-
-
 class GSheetStore:
     label = "Google Sheets"
 
@@ -104,7 +90,7 @@ class GSheetStore:
                     "https://www.googleapis.com/auth/drive"],
         )
         self.gspread = gspread
-        self.book = gspread.authorize(creds).open_by_key(st.secrets["sheet_id"])
+        self.book = gspread.authorize(creds).open_by_key(st.secrets["sheet_id"] if secrets_has("sheet_id") else SHEET_ID)
         self._sheets = {}
 
     def _retry(self, fn, tries=4):
@@ -145,7 +131,9 @@ class GSheetStore:
 
 @st.cache_resource
 def get_store():
-    return GSheetStore() if secrets_has("gcp_service_account") and secrets_has("sheet_id") else LocalStore()
+    if not secrets_has("gcp_service_account"):
+        raise RuntimeError("[gcp_service_account] is missing from Streamlit secrets.")
+    return GSheetStore()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -764,10 +752,12 @@ def main():
     try:
         get_store()
     except Exception as e:
-        st.error("Could not connect to Google Sheets. Check that `sheet_id` is correct, the Sheet is shared with the "
-                 "service account's `client_email` as **Editor**, and the Google Sheets + Drive APIs are enabled.")
+        st.error("Could not connect to your Google Sheet. Check that (1) the service-account details are in "
+                 "Streamlit **Secrets** under `[gcp_service_account]`, (2) the Sheet is shared with the "
+                 "service account's `client_email` as **Editor**, and (3) the Google Sheets and Drive APIs are enabled.")
         st.exception(e)
         st.stop()
+
     auth_gate()
 
     st.sidebar.title("🍽️ Restaurant Inventory")
@@ -778,8 +768,6 @@ def main():
         st.session_state.pop("is_admin", None)
         st.rerun()
     st.sidebar.caption(f"Storage: {get_store().label}")
-    if isinstance(get_store(), LocalStore):
-        st.sidebar.warning("Local files are lost when Streamlit Cloud restarts. Connect Google Sheets for permanent storage.")
     if st.sidebar.button("🔄 Refresh data"):
         _load.clear()
         st.rerun()
