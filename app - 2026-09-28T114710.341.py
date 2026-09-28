@@ -131,10 +131,16 @@ class GSheetStore:
 
 
 @st.cache_resource
-def get_store():
+def _make_store(schema_key):
+    """schema_key is only here so a redeploy with new tables builds a fresh connection
+    (otherwise Streamlit keeps serving the old cached one that doesn't know the new tabs)."""
     if not secrets_has("gcp_service_account"):
         raise RuntimeError("[gcp_service_account] is missing from Streamlit secrets.")
     return GSheetStore()
+
+
+def get_store():
+    return _make_store(repr(SCHEMA))
 
 
 @st.cache_data(ttl=120, show_spinner=False)
