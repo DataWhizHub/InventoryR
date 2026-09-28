@@ -30,7 +30,7 @@ import os
 import re
 import secrets as pysecrets
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -43,10 +43,11 @@ SHEET_ID = "12KVW70mON33I_51l8hlYCmQaarxGdqcOAtCjIVp8Gr4"
 SCHEMA = {
     "items": {"item": "str", "group": "str", "size": "str", "category": "str", "unit": "str",
               "sell_price": "num"},
-    "users": {"username": "str", "salt": "str", "hash": "str", "created": "str"},
+    "users": {"username": "str", "role": "str", "salt": "str", "hash": "str", "created": "str"},
+    "sessions": {"token_hash": "str", "username": "str", "expires": "str"},
     "purchases": {"date": "str", "month": "str", "item": "str", "qty": "num",
-                  "unit_price": "num", "supplier": "str", "note": "str"},
-    "counts": {"month": "str", "item": "str", "closing_qty": "num"},
+                  "unit_price": "num", "supplier": "str", "note": "str", "entered_by": "str"},
+    "counts": {"month": "str", "item": "str", "closing_qty": "num", "counted_by": "str"},
     "openings": {"month": "str", "item": "str", "qty": "num", "unit_price": "num"},
 }
 
@@ -370,83 +371,175 @@ def parse_legacy_excel(file):
 
 
 # ───────────────────────────── users / login ─────────────────────────────
-MAX_USERS = 3
+MAX_ADMINS = 1          # one Admin ...
+MAX_USERS = 3           # ... and three normal Users, each with their own account
+COOKIE = "inv_session"  # browser cookie that keeps people logged in
+SESSION_DAYS = 30
 
 
 def read_users():
-    return clean("users", get_store().read("users"))          # never cached: slot count must be exact
+    return clean("users", get_store().read("users"))          # never cached: slot counts must be exact
 
 
 def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
 
 
+def sha(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def is_admin():
-    return bool(st.session_state.get("is_admin"))
+    return st.session_state.get("role") == "Admin"
+
+
+def cookie_token():
+    try:
+        return st.context.cookies.get(COOKIE)
+    except Exception:
+        return None
+
+
+def emit_cookie():
+    """Runs the pending 'set / clear browser cookie' command (queued by login / logout)."""
+    cmd = st.session_state.pop("cookie_cmd", None)
+    if cmd:
+        token, max_age = cmd
+        html = (f"<script>window.parent.document.cookie = "
+                f"'{COOKIE}={token}; max-age={max_age}; path=/; SameSite=Lax';</script>")
+        if hasattr(st, "iframe"):                                # newer Streamlit
+            st.iframe(html, height=1)
+        else:                                                    # older Streamlit
+            import streamlit.components.v1 as components
+            components.html(html, height=0)
+
+
+def start_session(username, role, remember):
+    st.session_state["user"], st.session_state["role"] = username, role
+    if remember:                                                # save the login in the Sheet + browser
+        token = pysecrets.token_urlsafe(32)
+        sess = clean("sessions", get_store().read("sessions"))
+        sess = sess[pd.to_datetime(sess["expires"], errors="coerce") > datetime.now()]
+        new = pd.DataFrame([{"token_hash": sha(token), "username": username,
+                             "expires": (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")}])
+        get_store().write("sessions", pd.concat([sess, new], ignore_index=True))
+        st.session_state["cookie_cmd"] = (token, SESSION_DAYS * 86400)
+
+
+def restore_session():
+    """Log the person back in from the browser cookie (survives refresh / closing the tab)."""
+    token = cookie_token()
+    if not token:
+        return False
+    sess = clean("sessions", get_store().read("sessions"))
+    hit = sess[sess["token_hash"] == sha(token)]
+    if hit.empty or pd.to_datetime(hit.iloc[0]["expires"], errors="coerce") < datetime.now():
+        return False
+    users = read_users()
+    u = users[users["username"] == hit.iloc[0]["username"]]
+    if u.empty:
+        return False
+    st.session_state["user"], st.session_state["role"] = u.iloc[0]["username"], u.iloc[0]["role"] or "User"
+    return True
+
+
+def logout():
+    token = cookie_token()
+    if token:
+        sess = clean("sessions", get_store().read("sessions"))
+        get_store().write("sessions", sess[sess["token_hash"] != sha(token)])
+    for k in ("user", "role"):
+        st.session_state.pop(k, None)
+    st.session_state["cookie_cmd"] = ("", 0)
+    st.rerun()
+
+
+def change_password(old, new, new2):
+    users = read_users()
+    i = users.index[users["username"] == st.session_state["user"]][0]
+    if not hmac.compare_digest(hash_pw(old, users.at[i, "salt"]), users.at[i, "hash"]):
+        return "Current password is wrong."
+    if len(new) < 6 or new != new2:
+        return "New passwords must match and be at least 6 characters."
+    salt = pysecrets.token_hex(16)
+    users.at[i, "salt"], users.at[i, "hash"] = salt, hash_pw(new, salt)
+    get_store().write("users", users)
+    return None
 
 
 def users_admin():
     users = read_users()
-    st.caption(f"{len(users)} of {MAX_USERS} user slots used. The first registered user is the admin.")
+    admins = (users["role"] == "Admin").sum()
+    st.caption(f"Admin: {admins}/{MAX_ADMINS}   ·   Users: {len(users) - admins}/{MAX_USERS}. "
+               "Remove a user to free a slot (they can then register again).")
     for i, r in users.iterrows():
         c1, c2 = st.columns([4, 1])
-        c1.write(f"**{r['username']}**" + ("  (admin)" if i == 0 else f"  – registered {r['created'][:10]}"))
-        if i > 0 and c2.button("Remove", key=f"rm_{r['username']}"):
+        c1.write(f"**{r['username']}**  ·  {r['role'] or 'User'}  ·  registered {r['created'][:10]}")
+        if r["role"] != "Admin" and c2.button("Remove", key=f"rm_{r['username']}"):
             get_store().write("users", users.drop(index=i))
             st.rerun()
 
 
 def auth_gate():
-    if st.session_state.get("user"):
+    if st.session_state.get("user") or restore_session():
         return
-    st.title("🍽️ Restaurant Inventory")
+    st.markdown("<h1 style='text-align:center'>🍽️ Restaurant Inventory Management</h1>", unsafe_allow_html=True)
     users = read_users()
-    slots = MAX_USERS - len(users)
-    t_login, t_reg = st.tabs(["🔑 Login", "📝 Register"])
+    admins = int((users["role"] == "Admin").sum())
+    normal = len(users) - admins
+    roles_open = (["Admin"] if admins < MAX_ADMINS else []) + (["User"] if normal < MAX_USERS else [])
 
-    with t_login:
-        with st.form("login"):
-            u = st.text_input("Username")
-            p = st.text_input("Password", type="password")
-            if st.form_submit_button("Login", type="primary"):
-                row = users[users["username"] == u.strip().lower()]
-                if not row.empty and hmac.compare_digest(hash_pw(p, row.iloc[0]["salt"]), row.iloc[0]["hash"]):
-                    st.session_state["user"] = row.iloc[0]["username"]
-                    st.session_state["is_admin"] = bool(row.index[0] == 0)      # first registered user
-                    st.rerun()
-                st.error("Wrong username or password.")
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        t_login, t_reg = st.tabs(["🔑 Login", "📝 Register"])
 
-    with t_reg:
-        if slots <= 0:
-            st.warning(f"Registration is closed: the maximum of {MAX_USERS} users has been reached.")
-        else:
-            st.caption(f"{slots} of {MAX_USERS} user slots left.")
-            with st.form("register"):
-                u = st.text_input("Choose a username")
-                p1 = st.text_input("Password (min 6 characters)", type="password")
-                p2 = st.text_input("Repeat password", type="password")
-                code = st.text_input("Registration code", type="password") if secrets_has("registration_code") else ""
-                if st.form_submit_button("Create account"):
-                    u = u.strip().lower()
-                    fresh = read_users()
-                    if secrets_has("registration_code") and code != st.secrets["registration_code"]:
-                        st.error("Wrong registration code.")
-                    elif not re.fullmatch(r"[a-z0-9_.-]{3,20}", u):
-                        st.error("Username: 3-20 letters, numbers, _ . -")
-                    elif len(p1) < 6 or p1 != p2:
-                        st.error("Passwords must match and be at least 6 characters.")
-                    elif len(fresh) >= MAX_USERS:
-                        st.error("Registration is closed: maximum users reached.")
-                    elif u in fresh["username"].values:
-                        st.error("That username is taken.")
-                    else:
-                        salt = pysecrets.token_hex(16)
-                        new = pd.DataFrame([{"username": u, "salt": salt, "hash": hash_pw(p1, salt),
-                                             "created": datetime.now().isoformat(timespec="seconds")}])
-                        get_store().write("users", pd.concat([fresh, new], ignore_index=True))
-                        st.session_state["user"] = u
-                        st.session_state["is_admin"] = fresh.empty
+        with t_login:
+            with st.form("login"):
+                u = st.text_input("Username", key="login_user")
+                p = st.text_input("Password", type="password", key="login_pass")
+                remember = st.checkbox(f"Keep me logged in on this device ({SESSION_DAYS} days)", value=True)
+                if st.form_submit_button("Login", type="primary"):
+                    row = users[users["username"] == u.strip().lower()]
+                    if not row.empty and hmac.compare_digest(hash_pw(p, row.iloc[0]["salt"]), row.iloc[0]["hash"]):
+                        start_session(row.iloc[0]["username"], row.iloc[0]["role"] or "User", remember)
                         st.rerun()
+                    st.error("Wrong username or password.")
+
+        with t_reg:
+            if not roles_open:
+                st.warning(f"Registration is closed: {MAX_ADMINS} Admin and {MAX_USERS} Users are already registered.")
+            else:
+                st.caption(f"Free places – Admin: {MAX_ADMINS - admins}, Users: {MAX_USERS - normal}")
+                with st.form("register"):
+                    role = st.radio("Register as", roles_open, horizontal=True, key="reg_role")
+                    u = st.text_input("Choose a username", key="reg_user")
+                    p1 = st.text_input("Password (min 6 characters)", type="password", key="reg_p1")
+                    p2 = st.text_input("Repeat password", type="password", key="reg_p2")
+                    need = "admin_code" if role == "Admin" else "registration_code"
+                    code = st.text_input(f"{'Admin' if role == 'Admin' else 'Registration'} code", type="password",
+                                         key="reg_code") if secrets_has(need) else ""
+                    if st.form_submit_button("Create account", type="primary"):
+                        u = u.strip().lower()
+                        fresh = read_users()                     # re-check right before saving
+                        f_admins = int((fresh["role"] == "Admin").sum())
+                        full = f_admins >= MAX_ADMINS if role == "Admin" else len(fresh) - f_admins >= MAX_USERS
+                        if secrets_has(need) and code != st.secrets[need]:
+                            st.error("Wrong code.")
+                        elif not re.fullmatch(r"[a-z0-9_.-]{3,20}", u):
+                            st.error("Username: 3-20 letters, numbers, _ . -")
+                        elif len(p1) < 6 or p1 != p2:
+                            st.error("Passwords must match and be at least 6 characters.")
+                        elif full:
+                            st.error(f"No free {role} place left.")
+                        elif u in fresh["username"].values:
+                            st.error("That username is taken.")
+                        else:
+                            salt = pysecrets.token_hex(16)
+                            new = pd.DataFrame([{"username": u, "role": role, "salt": salt, "hash": hash_pw(p1, salt),
+                                                 "created": datetime.now().isoformat(timespec="seconds")}])
+                            get_store().write("users", pd.concat([fresh, new], ignore_index=True))
+                            start_session(u, role, True)
+                            st.rerun()
     st.stop()
 
 
@@ -585,6 +678,7 @@ def page_purchases():
                 new["month"] = new["date"].str[:7]
                 new["unit_price"] = [p if pd.notna(p) else lp.get(i, 0.0) for i, p in zip(new["item"], new["unit_price"])]
                 new["note"] = ""
+                new["entered_by"] = st.session_state["user"]
                 save("purchases", pd.concat([load("purchases"), new], ignore_index=True))
                 st.success(f"Saved {len(new)} purchase line(s).")
                 st.rerun()
@@ -606,7 +700,8 @@ def page_purchases():
                     "item": st.column_config.SelectboxColumn("Item", options=names, required=True),
                     "qty": st.column_config.NumberColumn("Qty", format="%.2f"),
                     "unit_price": st.column_config.NumberColumn("Unit price", format="%.2f"),
-                    "supplier": "Supplier", "note": "Note"})
+                    "supplier": "Supplier", "note": "Note", "entered_by": "Entered by"},
+                disabled=["entered_by"])
             st.metric("Total purchased this month", f"{(ed['qty'].fillna(0) * ed['unit_price'].fillna(0)).sum():,.2f}")
             if st.button("Save changes to this month"):
                 ed = ed.dropna(subset=["item"]).copy()
@@ -657,6 +752,7 @@ def page_stock_take():
     if st.button("💾 Save stock take", type="primary"):
         new = done[["item", "counted"]].rename(columns={"counted": "closing_qty"})
         new.insert(0, "month", m)
+        new["counted_by"] = st.session_state["user"]
         save("counts", pd.concat([counts[counts["month"] != m], new], ignore_index=True))
         st.success(f"Stock take for {m} saved. Next month's opening stock is now set.")
         st.rerun()
@@ -664,13 +760,9 @@ def page_stock_take():
 
 def page_setup():
     st.header("⚙️ Setup")
-    labels = ["📦 Items", "🏁 Opening stock", "📥 Import from Excel"]
     admin = is_admin()
-    tabs = st.tabs(labels + (["👥 Users"] if admin else []))
-    t1, t2, t3 = tabs[:3]
-    if admin:
-        with tabs[3]:
-            users_admin()
+    tabs = st.tabs(["📦 Items"] + (["🏁 Opening stock", "📥 Import from Excel", "👥 Users"] if admin else []))
+    t1 = tabs[0]
 
     with t1:
         st.caption("Add / edit items. **Selling price** is optional (for drinks etc.) – it enables Sales value & Margin. "
@@ -699,6 +791,13 @@ def page_setup():
                 save("items", ed)
                 st.success("Items saved.")
                 st.rerun()
+
+    if not admin:
+        st.info("Opening stock, Excel import and user management are available to the Admin only.")
+        return
+    t2, t3, t4 = tabs[1:]
+    with t4:
+        users_admin()
 
     with t2:
         items = load("items")
@@ -748,6 +847,17 @@ def page_setup():
 
 
 # ───────────────────────────── main ─────────────────────────────
+STYLE = """
+<style>
+.block-container {padding-top: 1.6rem;}
+div[data-testid="stMetric"] {background: rgba(128,128,128,.08); border: 1px solid rgba(128,128,128,.25);
+                             border-radius: 10px; padding: 10px 14px;}
+.app-banner {background: linear-gradient(90deg,#1f4e79,#2e75b6); color: #fff; padding: 14px 22px;
+             border-radius: 12px; margin-bottom: 1rem; font-size: 1.35rem; font-weight: 600;}
+</style>
+"""
+
+
 def main():
     try:
         get_store()
@@ -758,19 +868,32 @@ def main():
         st.exception(e)
         st.stop()
 
+    st.markdown(STYLE, unsafe_allow_html=True)
+    emit_cookie()
     auth_gate()
 
-    st.sidebar.title("🍽️ Restaurant Inventory")
-    page = st.sidebar.radio("Menu", ["📊 Monthly Report", "🛒 Purchases", "📋 Month-End Stock Take", "⚙️ Setup"])
-    st.sidebar.write(f"👤 Signed in as **{st.session_state['user']}**")
-    if st.sidebar.button("Logout"):
-        st.session_state.pop("user", None)
-        st.session_state.pop("is_admin", None)
-        st.rerun()
-    st.sidebar.caption(f"Storage: {get_store().label}")
-    if st.sidebar.button("🔄 Refresh data"):
-        _load.clear()
-        st.rerun()
+    st.markdown("<div class='app-banner'>🍽️ Restaurant Inventory Management System</div>", unsafe_allow_html=True)
+    with st.sidebar:
+        st.title("Menu")
+        page = st.radio("Menu", ["📊 Monthly Report", "🛒 Purchases", "📋 Month-End Stock Take", "⚙️ Setup"],
+                        label_visibility="collapsed")
+        st.divider()
+        st.write(f"👤 **{st.session_state['user']}**  ·  {st.session_state['role']}")
+        with st.expander("🔒 Change password"):
+            with st.form("chpw", clear_on_submit=True):
+                old = st.text_input("Current password", type="password")
+                n1 = st.text_input("New password", type="password")
+                n2 = st.text_input("Repeat new password", type="password")
+                if st.form_submit_button("Change"):
+                    err = change_password(old, n1, n2)
+                    st.error(err) if err else st.success("Password changed.")
+        if st.button("Logout"):
+            logout()
+        st.caption(f"Storage: {get_store().label}")
+        if st.button("🔄 Refresh data"):
+            _load.clear()
+            st.rerun()
+
     {"📊 Monthly Report": page_report, "🛒 Purchases": page_purchases,
      "📋 Month-End Stock Take": page_stock_take, "⚙️ Setup": page_setup}[page]()
 
