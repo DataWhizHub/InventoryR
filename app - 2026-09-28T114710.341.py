@@ -15,7 +15,10 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 html,body,[class*="css"]{font-family:Inter,sans-serif}
 .stApp{background:#f5f7fb}
-.block-container{max-width:1550px;padding-top:1rem}
+.block-container{max-width:1550px;padding-top:3.5rem!important;padding-bottom:2rem!important}
+[data-testid="stAppViewContainer"]{overflow:visible!important}
+[data-testid="stHeader"]{background:transparent!important}
+.pos-title{display:block!important;visibility:visible!important;overflow:visible!important;line-height:1.25!important;padding-top:0.15rem!important;margin:0 0 .25rem 0!important;color:#111827!important;position:relative;z-index:2}
 [data-testid="stSidebar"]{background:#111827}
 [data-testid="stSidebar"] *{color:#f9fafb!important}
 h1,h2,h3{color:#111827}
