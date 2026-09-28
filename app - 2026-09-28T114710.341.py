@@ -764,6 +764,142 @@ def page_stock_take():
         st.rerun()
 
 
+def flash():
+    msg = st.session_state.pop("flash", None)
+    if msg:
+        st.success(msg)
+
+
+def item_picker(items, key):
+    """Two drop-downs: Item (group, e.g. Water) -> Size (500ml / 1l / 1.5ml / 5l). Returns the full item name."""
+    it = items.assign(_g=items["group"].where(items["group"] != "", items["item"]))
+    groups = list(dict.fromkeys(it["_g"]))
+    c1, c2 = st.columns(2)
+    g = c1.selectbox("Item", groups, key=f"{key}_group")
+    sub = it[it["_g"] == g].reset_index(drop=True)
+    labels = [sz or "— (no size)" for sz in sub["size"]]
+    i = c2.selectbox("Size", range(len(sub)), format_func=lambda k: labels[k], key=f"{key}_size_{g}")
+    return sub.loc[i, "item"]
+
+
+def month_end_entry(items):
+    months = available_months()
+    if items.empty or not months:
+        return need_setup()
+    m = st.selectbox("Month being closed", months[::-1], index=1 if len(months) > 1 else 0, key="ae_month")
+    cur = compute(m)
+    cur = cur[cur["month"] == m].set_index("item")
+
+    name = item_picker(items, "ae")
+    r = cur.loc[name]
+    counts = load("counts")
+    mine = counts[(counts["month"] == m) & (counts["item"] == name)]
+    saved = float(mine["closing_qty"].iloc[0]) if not mine.empty else None
+
+    c = st.columns(4)
+    c[0].metric("Opening stock", f"{r['open_qty']:,.2f}")
+    c[1].metric("Purchased this month", f"{r['purch_qty']:,.2f}")
+    c[2].metric("Expected in stock", f"{r['available']:,.2f}")
+    c[3].metric("Already entered", "–" if saved is None else f"{saved:,.2f}")
+
+    qty = st.number_input("Closing stock – quantity left on the shelf", min_value=0.0, value=saved, step=1.0,
+                          format="%.2f", placeholder="Type the counted quantity", key=f"ae_qty_{m}_{name}_{ver()}")
+    if qty is not None:
+        sold = r["available"] - qty
+        p = st.columns(2)
+        p[0].metric("Sold quantity", f"{sold:,.2f}")
+        p[1].metric("Sold value (at cost)", f"{sold * r['avg_cost']:,.2f}")
+        if sold < 0:
+            st.warning("Counted more than Opening + Purchases. Check the count or a missing purchase.")
+
+    if st.button("💾 Save closing stock", type="primary", disabled=qty is None):
+        row = pd.DataFrame([{"month": m, "item": name, "closing_qty": qty, "counted_by": st.session_state["user"]}])
+        save("counts", pd.concat([counts[~((counts["month"] == m) & (counts["item"] == name))], row],
+                                 ignore_index=True))
+        st.session_state["flash"] = f"Saved: {name} – closing stock {qty:,.2f} for {m}."
+        st.rerun()
+
+    st.divider()
+    counts = load("counts")
+    month_counts = counts[counts["month"] == m]
+    stocked = cur[cur["available"] > 0]
+    entered = stocked.index.isin(month_counts["item"])
+    st.progress(float(entered.mean()) if len(stocked) else 1.0,
+                text=f"{int(entered.sum())} of {len(stocked)} items with stock entered for {m}")
+    with st.expander("✅ Entered this month"):
+        done = month_counts.merge(cur[["available", "avg_cost"]].reset_index(), on="item", how="left")
+        done["sold_qty"] = done["available"] - done["closing_qty"]
+        st.dataframe(done[["item", "closing_qty", "available", "sold_qty", "counted_by"]], hide_index=True,
+                     width="stretch", column_config={
+                         "item": "Item", "closing_qty": st.column_config.NumberColumn("Closing", format="%.2f"),
+                         "available": st.column_config.NumberColumn("Expected", format="%.2f"),
+                         "sold_qty": st.column_config.NumberColumn("Sold", format="%.2f"),
+                         "counted_by": "Entered by"})
+        rm = st.multiselect("Remove entries (to re-enter them)", done["item"].tolist(), key=f"ae_rm_{ver()}")
+        if rm and st.button("Remove selected"):
+            save("counts", counts[~((counts["month"] == m) & counts["item"].isin(rm))])
+            st.rerun()
+    with st.expander("⏳ Still to enter"):
+        todo = stocked[~entered].reset_index()[["item", "available"]]
+        st.dataframe(todo, hide_index=True, width="stretch", column_config={
+            "item": "Item", "available": st.column_config.NumberColumn("Expected in stock", format="%.2f")})
+
+
+def new_item_form(items):
+    it = items.assign(_g=items["group"].where(items["group"] != "", items["item"]))
+    groups = list(dict.fromkeys(it["_g"]))
+    cats = sorted(c for c in items["category"].unique() if c)
+    NEW_G, NEW_C = "➕ New item group…", "➕ New category…"
+    st.caption("Add an item that is not in the list yet. To add another size of an existing item "
+               "(e.g. Water 2l), pick the group and type the new size.")
+    with st.form("new_item", clear_on_submit=True):
+        g_sel = st.selectbox("Item group", [NEW_G] + groups)
+        g_new = st.text_input("New group name (only if you chose “New item group”)", placeholder="e.g. Sprite")
+        size = st.text_input("Size / variant (leave blank if none)", placeholder="e.g. 500ml, 1l, Small")
+        c_sel = st.selectbox("Category", cats + [NEW_C])
+        c_new = st.text_input("New category name (only if you chose “New category”)")
+        u1, u2 = st.columns(2)
+        unit = u1.text_input("Unit", placeholder="kg, bottle, pkt …")
+        sell = u2.number_input("Selling price (optional)", min_value=0.0, value=None, format="%.2f")
+        st.markdown("**Stock you already have of this item (optional)**")
+        q1, q2 = st.columns(2)
+        qty_now = q1.number_input("Quantity in stock now", min_value=0.0, value=None, format="%.2f")
+        price_now = q2.number_input("Unit price (cost)", min_value=0.0, value=None, format="%.2f")
+        if st.form_submit_button("➕ Add item", type="primary"):
+            group = g_new.strip() if g_sel == NEW_G else g_sel
+            cat = c_new.strip() if c_sel == NEW_C else c_sel
+            name = f"{group} {size.strip()}".strip()
+            if not group:
+                st.error("Choose an item group or type a new one.")
+            elif name in items["item"].values:
+                st.error(f"'{name}' already exists.")
+            elif (qty_now or 0) > 0 and price_now is None:
+                st.error("Enter the unit price for the stock you already have.")
+            else:
+                row = pd.DataFrame([{"item": name, "group": group, "size": size.strip(), "category": cat,
+                                     "unit": unit.strip(), "sell_price": sell}])
+                save("items", pd.concat([items, row], ignore_index=True))
+                if (qty_now or 0) > 0:                         # existing stock is recorded as a purchase today
+                    today = date.today()
+                    pur = pd.DataFrame([{"date": str(today), "month": today.strftime("%Y-%m"), "item": name,
+                                         "qty": qty_now, "unit_price": price_now, "supplier": "",
+                                         "note": "Opening balance (new item)", "entered_by": st.session_state["user"]}])
+                    save("purchases", pd.concat([load("purchases"), pur], ignore_index=True))
+                st.session_state["flash"] = f"Item added: {name}"
+                st.rerun()
+
+
+def page_add_item():
+    st.header("➕ Add Item")
+    flash()
+    items = load("items")
+    t1, t2 = st.tabs(["📋 Month-end stock entry", "🆕 New item"])
+    with t1:
+        month_end_entry(items)
+    with t2:
+        new_item_form(items)
+
+
 def page_setup():
     st.header("⚙️ Setup")
     admin = is_admin()
@@ -881,7 +1017,7 @@ def main():
     st.markdown("<div class='app-banner'>🍽️ Restaurant Inventory Management System</div>", unsafe_allow_html=True)
     with st.sidebar:
         st.title("Menu")
-        page = st.radio("Menu", ["📊 Monthly Report", "🛒 Purchases", "📋 Month-End Stock Take", "⚙️ Setup"],
+        page = st.radio("Menu", ["📊 Monthly Report", "➕ Add Item", "🛒 Purchases", "📋 Month-End Stock Take", "⚙️ Setup"],
                         label_visibility="collapsed")
         st.divider()
         st.write(f"👤 **{st.session_state['user']}**  ·  {st.session_state['role']}")
@@ -900,7 +1036,7 @@ def main():
             _load.clear()
             st.rerun()
 
-    {"📊 Monthly Report": page_report, "🛒 Purchases": page_purchases,
+    {"📊 Monthly Report": page_report, "➕ Add Item": page_add_item, "🛒 Purchases": page_purchases,
      "📋 Month-End Stock Take": page_stock_take, "⚙️ Setup": page_setup}[page]()
 
 
