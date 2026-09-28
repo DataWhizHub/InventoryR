@@ -1,1043 +1,383 @@
-"""
-Restaurant Inventory Management System  (Streamlit)
-
-Monthly cycle
-  1. Record purchases through the month            -> "Purchases"
-  2. At month end count what is left on the shelf   -> "Month-End Stock Take"
-  3. Read the report: Opening + Purchases - Closing = SOLD (qty and value)
-  4. Next month's Opening stock = this month's Closing stock (automatic)
-
-Storage: Google Sheets ONLY (no local files). Tabs items / purchases / counts / openings / users
-are created automatically in the Sheet.
-
-Streamlit secrets (.streamlit/secrets.toml, or the "Secrets" box on Streamlit Cloud):
-    [gcp_service_account]
-    type = "service_account"
-    project_id = "..."
-    private_key_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-    client_email = "...@...iam.gserviceaccount.com"
-    client_id = "..."
-    token_uri = "https://oauth2.googleapis.com/token"
-    # sheet_id = "..."           <- optional, overrides SHEET_ID below
-    # registration_code = "..."  <- optional, required to register
-The Google Sheet must be shared with client_email as EDITOR.
-"""
-import hashlib
-import hmac
-import io
-import os
-import re
-import secrets as pysecrets
-import time
-from datetime import date, datetime, timedelta
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import sqlite3
+import hashlib
+import io
+from datetime import date, datetime
+from pathlib import Path
 
-st.set_page_config(page_title="Restaurant Inventory", page_icon="🍽️", layout="wide")
+st.set_page_config(page_title="Restaurant POS Inventory", page_icon="🍽️", layout="wide", initial_sidebar_state="expanded")
 
-# Your Google Sheet (the long id in its URL). Not a secret, but the service-account key IS - keep it in st.secrets.
-SHEET_ID = "12KVW70mON33I_51l8hlYCmQaarxGdqcOAtCjIVp8Gr4"
+DB = "restaurant_pos.db"
 
-SCHEMA = {
-    "items": {"item": "str", "group": "str", "size": "str", "category": "str", "unit": "str",
-              "sell_price": "num"},
-    "users": {"username": "str", "role": "str", "salt": "str", "hash": "str", "created": "str"},
-    "sessions": {"token_hash": "str", "username": "str", "expires": "str"},
-    "purchases": {"date": "str", "month": "str", "item": "str", "qty": "num",
-                  "unit_price": "num", "supplier": "str", "note": "str", "entered_by": "str"},
-    "counts": {"month": "str", "item": "str", "closing_qty": "num", "counted_by": "str"},
-    "openings": {"month": "str", "item": "str", "qty": "num", "unit_price": "num"},
-}
-
-
-# ───────────────────────────── helpers ─────────────────────────────
-def secrets_has(key):
-    try:
-        return key in st.secrets
-    except Exception:
-        return False
-
-
-def clean(table, df):
-    """Force the right columns / types on a table."""
-    df = df.copy()
-    for col, kind in SCHEMA[table].items():
-        if col not in df.columns:
-            df[col] = None
-        if kind == "num":
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
-        else:
-            df[col] = df[col].fillna("").astype(str).str.strip()
-    df = df[list(SCHEMA[table])]
-    key = "item" if "item" in df.columns else "username" if "username" in df.columns else None
-    if key:
-        df = df[df[key] != ""]
-    return df.reset_index(drop=True)
-
-
-# ───────────────────────────── storage ─────────────────────────────
-class GSheetStore:
-    label = "Google Sheets"
-
-    def __init__(self):
-        import gspread
-        from google.oauth2.service_account import Credentials
-
-        creds = Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]),
-            scopes=["https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive"],
-        )
-        self.gspread = gspread
-        self.book = gspread.authorize(creds).open_by_key(st.secrets["sheet_id"] if secrets_has("sheet_id") else SHEET_ID)
-        self._sheets = {}
-
-    def _retry(self, fn, tries=4):
-        for i in range(tries):
-            try:
-                return fn()
-            except self.gspread.exceptions.APIError:
-                if i == tries - 1:
-                    raise
-                time.sleep(2 ** i)              # back off on quota / temporary errors
-
-    def _ws(self, t):
-        if t not in self._sheets:
-            try:
-                ws = self._retry(lambda: self.book.worksheet(t))
-            except self.gspread.WorksheetNotFound:
-                ws = self._retry(lambda: self.book.add_worksheet(title=t, rows=1000, cols=len(SCHEMA[t])))
-            self._sheets[t] = ws
-        return self._sheets[t]
-
-    def read(self, t):
-        values = self._retry(lambda: self._ws(t).get_all_values())
-        if len(values) < 2:
-            return pd.DataFrame(columns=list(SCHEMA[t]))
-        return pd.DataFrame(values[1:], columns=values[0])
-
-    def write(self, t, df):
-        ws = self._ws(t)
-        out = df.astype(object).where(df.notna(), "")
-        rows = [list(df.columns)] + out.values.tolist()
-
-        def _do():
-            ws.clear()
-            ws.update(range_name="A1", values=rows, value_input_option="RAW")
-
-        self._retry(_do)
-
-
-@st.cache_resource
-def _make_store(schema_key):
-    """schema_key is only here so a redeploy with new tables builds a fresh connection
-    (otherwise Streamlit keeps serving the old cached one that doesn't know the new tabs)."""
-    if not secrets_has("gcp_service_account"):
-        raise RuntimeError("[gcp_service_account] is missing from Streamlit secrets.")
-    return GSheetStore()
-
-
-def get_store():
-    return _make_store(repr(SCHEMA))
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def _load(t):
-    return clean(t, get_store().read(t))
-
-
-def load(t):
-    return _load(t).copy()
-
-
-def save(t, df):
-    get_store().write(t, clean(t, df))
-    _load.clear()
-    st.session_state["ver"] = st.session_state.get("ver", 0) + 1
-
-
-def ver():
-    return st.session_state.get("ver", 0)
-
-
-# ───────────────────────────── calculation engine ─────────────────────────────
-def baseline_month():
-    o = load("openings")
-    return None if o.empty else o["month"].min()
-
-
-def available_months():
-    first = baseline_month()
-    if not first:
-        return []
-    last = max(date.today().strftime("%Y-%m"), load("counts")["month"].max() or "")
-    return [str(p) for p in pd.period_range(first, last, freq="M")]
-
-
-def compute(upto):
-    """
-    One row per item per month, from the opening-stock month up to `upto`.
-    Sold = Opening + Purchases - Closing.  Value uses the weighted-average cost
-    of (opening stock + that month's purchases).
-    """
-    items, purchases = load("items"), load("purchases")
-    counts, openings = load("counts"), load("openings")
-    if openings.empty or not upto:
-        return pd.DataFrame()
-
-    first = openings["month"].min()
-    months = [str(p) for p in pd.period_range(first, upto, freq="M")]
-    openings = openings[openings["month"] == first]
-    purchases = purchases.assign(qty=purchases["qty"].fillna(0),
-                                 unit_price=purchases["unit_price"].fillna(0))
-    purchases["value"] = purchases["qty"] * purchases["unit_price"]
-    last_price = purchases.sort_values("date").groupby("item")["unit_price"].last().to_dict()
-
-    state = {r.item: (0.0 if pd.isna(r.qty) else r.qty, 0.0 if pd.isna(r.unit_price) else r.unit_price)
-             for r in openings.itertuples()}
-    meta = items.set_index("item")
-    rows = []
-    for m in months:
-        pm = purchases[purchases["month"] == m].groupby("item").agg(pq=("qty", "sum"), pv=("value", "sum"))
-        cm = counts[counts["month"] == m].set_index("item")["closing_qty"].dropna()
-        month_closed = len(cm) > 0
-        for item in items["item"]:
-            oq, oc = state.get(item, (0.0, 0.0))
-            pq, pv = (pm.loc[item, "pq"], pm.loc[item, "pv"]) if item in pm.index else (0.0, 0.0)
-            avail = oq + pq
-            cost = (oq * oc + pv) / avail if avail > 0 else (oc or last_price.get(item, 0.0))
-            counted = item in cm.index
-            if counted:
-                cq, status = float(cm[item]), "Counted"
-            elif avail == 0:
-                cq, status = 0.0, "Counted"
-            elif month_closed:
-                cq, status = None, "Not counted"
-            else:
-                cq, status = None, "Open month"
-            sold = None if cq is None else avail - cq
-            if sold is not None and sold < -1e-9:
-                status = "Check: count > stock"
-            sp = meta.loc[item, "sell_price"]
-            rows.append({
-                "month": m, "item": item, "group": meta.loc[item, "group"] or item, "size": meta.loc[item, "size"],
-                "category": meta.loc[item, "category"], "unit": meta.loc[item, "unit"],
-                "open_qty": oq, "open_value": oq * oc, "purch_qty": pq, "purch_value": pv,
-                "available": avail, "avg_cost": cost, "closing_qty": cq,
-                "closing_value": None if cq is None else cq * cost,
-                "sold_qty": sold, "sold_value": None if sold is None else sold * cost,
-                "sell_price": sp,
-                "sales_value": sold * sp if (sold is not None and pd.notna(sp) and sp > 0) else None,
-                "status": status,
-            })
-            state[item] = ((avail if cq is None else cq), cost)
-    df = pd.DataFrame(rows)
-    df["margin"] = df["sales_value"] - df["sold_value"]
-    return df
-
-
-# ───────────────────────────── legacy Excel importer ─────────────────────────────
-SIZE_RE = re.compile(r"\s+(\d+(?:\.\d+)?\s*(?:ml|l|g|kg)|small|medium|large)$", re.I)
-
-
-def split_group_size(name):
-    """'Water 1.5ml' -> ('Water', '1.5ml');  'Butter' -> ('Butter', '')"""
-    m = SIZE_RE.search(name)
-    return (name[:m.start()].strip(), m.group(1).strip()) if m else (name, "")
-
-
-MONTH_NUM = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun",
-                                          "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
-
-CATEGORY_RULES = [
-    ("Beverages", ["water", "coca", "sprite", "egb", "soda", "tonic", "ginger ale", "pepsi", "7up",
-                   "redbull", "aloe", "ole ", "fyre", "nescafe bottle"]),
-    ("Tea & Coffee", ["coffee", "tea", "nescafe", "nestea", "n.cafe", "n.tea"]),
-    ("Dairy & Desserts", ["watalappan", "kalkiri", "yougurt", "curd", "jelly", "milk", "cheese", "butter",
-                          "ice cream", "chocolate", "strawberry", "fruit & nut", "toping", "ghee"]),
-    ("Sauces & Pastes", ["sauce", "paste", "chutney", "mustard cream", "mayonise", "ketchup", "oyster",
-                         "vinegar", "stock powder", "rose water", "soya"]),
-    ("Spices", ["snoring", "cinnamon", "cardamom", "cloves", "mustard seeds", "uluhal", "chilie", "turmeric",
-                "pepper", "curry", "roast", "masala", "biriyani", "papadam"]),
-    ("Dry Goods", ["rice", "kekulu", "samba", "basmathi", "dhal", "sugar", "salt", "noodle", "pasta",
-                   "spagathie", "soyameat", "flour", "hoppers", "biscuit", "oil can", "peas"]),
-    ("Frozen & Snacks", ["roll", "cutlet", "french fries", "kottu", "bread", "bun", "sausage", "drumstick"]),
-    ("Meat & Seafood", ["buriyani", "chicken", "beef", "pork", "mutton", "fish", "prawn", "cuttlefish",
-                        "seafood", "portion", "r/c"]),
-    ("Vegetables & Eggs", ["onion", "garlic", "potato", "mushroom", "carrot", "leeks", "cabbage", "tomato",
-                           "chillie", "cucumber", "capcicum", "minchi", "salad", "coriander", "bellpaper",
-                           "beans", "egg"]),
-    ("Packaging & Cleaning", ["grocery", "shoping", "lunch sheet", "serviatte", "tissue", "tooth pic", "straw",
-                              "dishwash", "clorex", "moping", "handwash", "pinol", "cleaner"]),
-]
-
-
-def guess_category(name):
-    n = name.lower() + " "
-    for cat, words in CATEGORY_RULES:
-        if any(w in n for w in words):
-            return cat
-    return "Other"
-
-
-def parse_qty(v, name, warnings):
-    if v is None or v == "":
-        return 0.0
-    if isinstance(v, (int, float)):
-        n, unit = float(v), None
-    else:
-        m = re.fullmatch(r"([\d.]+)\s*(kg|g|l)?", str(v).strip().lower().replace(",", ""))
-        if not m:
-            warnings.append(f"{name}: could not read quantity '{v}' -> used 0")
-            return 0.0
-        n, unit = float(m[1]), m[2]
-    if "oil can" in name.lower():                       # counted in cans; sheet mixes litres and cans
-        if unit == "l" or n >= 10:
-            return n / 20
-        return n
-    return n / 1000 if unit == "g" else n
-
-
-def parse_price(v, name, warnings):
-    if v is None or v == "":
-        return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip().lower().replace(",", "")
-    m = re.fullmatch(r"\((\d+(?:\.\d+)?)\s*g\)\s*([\d.]+)", s)
-    if m:                                               # price per 25g -> price per kg
-        return float(m[2]) * 1000 / float(m[1])
-    m = re.fullmatch(r"\(\d+\s*pkt\)\s*([\d.]+)", s)
-    if m:
-        return float(m[1])
-    try:
-        return float(s)
-    except ValueError:
-        warnings.append(f"{name}: could not read price '{v}' -> used 0")
-        return 0.0
-
-
-def parse_legacy_excel(file):
-    from openpyxl import load_workbook
-
-    ws = load_workbook(file, data_only=True).active
-    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-    blocks = []
-    for idx, v in enumerate(header):
-        m = re.match(r"\s*(opening|purchases|closing)[^(]*\((\w{3})\w*\s+(\d{4})\)", str(v or ""), re.I)
-        if m:
-            blocks.append((m[1].lower(), f"{m[3]}-{MONTH_NUM[m[2][:3].lower()]:02d}", idx))
-    if not blocks:
-        raise ValueError("Could not find 'Opening / Purchases / Closing Stock (Mon YYYY)' headers in row 1.")
-
-    warnings, items, openings, purchases, counts = [], [], [], [], []
-    seen, base = {}, ""
-
-    for row in ws.iter_rows(min_row=3, values_only=True):
-        raw = row[0]
-        if raw is None:
-            continue
-        label = str(raw).strip()
-        if label.lower() == "total":
-            break
-        if all(c is None for c in row[1:]):             # section header e.g. "Water"
-            base = label
-            continue
-        variant = label[:1].isdigit() or label.lower() in {"small", "medium", "large"}   # sizes: 500ml, 1l, Medium...
-        name = f"{base} {label}" if variant else label
-        if not variant:
-            base = split_group_size(label)[0]
-        name = re.sub(r"\s+", " ", name).strip()
-        seen[name] = seen.get(name, 0) + 1
-        if seen[name] > 1:
-            new = f"{name} ({seen[name]})"
-            warnings.append(f"Duplicate item name '{name}' -> imported as '{new}' (rename it in Setup if you like)")
-            name = new
-        grp, size = split_group_size(name)
-        items.append({"item": name, "group": grp, "size": size, "category": guess_category(name),
-                      "unit": "", "sell_price": None})
-
-        for kind, month, c in blocks:
-            q = parse_qty(row[c], name, warnings)
-            p = parse_price(row[c + 1], name, warnings) if c + 1 < len(row) else 0.0
-            if kind == "opening":
-                openings.append({"month": month, "item": name, "qty": q, "unit_price": p})
-            elif kind == "purchases" and q > 0:
-                purchases.append({"date": str(pd.Period(month).end_time.date()), "month": month, "item": name,
-                                  "qty": q, "unit_price": p, "supplier": "", "note": "Imported from Excel"})
-                if p == 0:
-                    warnings.append(f"{name}: purchase in {month} has price 0")
-            elif kind == "closing":
-                counts.append({"month": month, "item": name, "closing_qty": q})
-
-    return {"items": pd.DataFrame(items), "openings": pd.DataFrame(openings),
-            "purchases": pd.DataFrame(purchases), "counts": pd.DataFrame(counts)}, warnings
-
-
-# ───────────────────────────── users / login ─────────────────────────────
-MAX_ADMINS = 1          # one Admin ...
-MAX_USERS = 3           # ... and three normal Users, each with their own account
-COOKIE = "inv_session"  # browser cookie that keeps people logged in
-SESSION_DAYS = 30
-
-
-def read_users():
-    return clean("users", get_store().read("users"))          # never cached: slot counts must be exact
-
-
-def hash_pw(pw, salt):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
-
-
-def sha(token):
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def is_admin():
-    return st.session_state.get("role") == "Admin"
-
-
-def cookie_token():
-    try:
-        return st.context.cookies.get(COOKIE)
-    except Exception:
-        return None
-
-
-def emit_cookie():
-    """Runs the pending 'set / clear browser cookie' command (queued by login / logout)."""
-    cmd = st.session_state.pop("cookie_cmd", None)
-    if cmd:
-        token, max_age = cmd
-        html = (f"<script>window.parent.document.cookie = "
-                f"'{COOKIE}={token}; max-age={max_age}; path=/; SameSite=Lax';</script>")
-        if hasattr(st, "iframe"):                                # newer Streamlit
-            st.iframe(html, height=1)
-        else:                                                    # older Streamlit
-            import streamlit.components.v1 as components
-            components.html(html, height=0)
-
-
-def start_session(username, role, remember):
-    st.session_state["user"], st.session_state["role"] = username, role
-    if remember:                                                # save the login in the Sheet + browser
-        token = pysecrets.token_urlsafe(32)
-        sess = clean("sessions", get_store().read("sessions"))
-        sess = sess[pd.to_datetime(sess["expires"], errors="coerce") > datetime.now()]
-        new = pd.DataFrame([{"token_hash": sha(token), "username": username,
-                             "expires": (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")}])
-        get_store().write("sessions", pd.concat([sess, new], ignore_index=True))
-        st.session_state["cookie_cmd"] = (token, SESSION_DAYS * 86400)
-
-
-def restore_session():
-    """Log the person back in from the browser cookie (survives refresh / closing the tab)."""
-    token = cookie_token()
-    if not token:
-        return False
-    sess = clean("sessions", get_store().read("sessions"))
-    hit = sess[sess["token_hash"] == sha(token)]
-    if hit.empty or pd.to_datetime(hit.iloc[0]["expires"], errors="coerce") < datetime.now():
-        return False
-    users = read_users()
-    u = users[users["username"] == hit.iloc[0]["username"]]
-    if u.empty:
-        return False
-    st.session_state["user"], st.session_state["role"] = u.iloc[0]["username"], u.iloc[0]["role"] or "User"
-    return True
-
-
-def logout():
-    token = cookie_token()
-    if token:
-        sess = clean("sessions", get_store().read("sessions"))
-        get_store().write("sessions", sess[sess["token_hash"] != sha(token)])
-    for k in ("user", "role"):
-        st.session_state.pop(k, None)
-    st.session_state["cookie_cmd"] = ("", 0)
-    st.rerun()
-
-
-def change_password(old, new, new2):
-    users = read_users()
-    i = users.index[users["username"] == st.session_state["user"]][0]
-    if not hmac.compare_digest(hash_pw(old, users.at[i, "salt"]), users.at[i, "hash"]):
-        return "Current password is wrong."
-    if len(new) < 6 or new != new2:
-        return "New passwords must match and be at least 6 characters."
-    salt = pysecrets.token_hex(16)
-    users.at[i, "salt"], users.at[i, "hash"] = salt, hash_pw(new, salt)
-    get_store().write("users", users)
-    return None
-
-
-def users_admin():
-    users = read_users()
-    admins = (users["role"] == "Admin").sum()
-    st.caption(f"Admin: {admins}/{MAX_ADMINS}   ·   Users: {len(users) - admins}/{MAX_USERS}. "
-               "Remove a user to free a slot (they can then register again).")
-    for i, r in users.iterrows():
-        c1, c2 = st.columns([4, 1])
-        c1.write(f"**{r['username']}**  ·  {r['role'] or 'User'}  ·  registered {r['created'][:10]}")
-        if r["role"] != "Admin" and c2.button("Remove", key=f"rm_{r['username']}"):
-            get_store().write("users", users.drop(index=i))
-            st.rerun()
-
-
-def auth_gate():
-    if st.session_state.get("user") or restore_session():
-        return
-    st.markdown("<h1 style='text-align:center'>🍽️ Restaurant Inventory Management</h1>", unsafe_allow_html=True)
-    users = read_users()
-    admins = int((users["role"] == "Admin").sum())
-    normal = len(users) - admins
-    roles_open = (["Admin"] if admins < MAX_ADMINS else []) + (["User"] if normal < MAX_USERS else [])
-
-    _, mid, _ = st.columns([1, 2, 1])
-    with mid:
-        t_login, t_reg = st.tabs(["🔑 Login", "📝 Register"])
-
-        with t_login:
-            with st.form("login"):
-                u = st.text_input("Username", key="login_user")
-                p = st.text_input("Password", type="password", key="login_pass")
-                remember = st.checkbox(f"Keep me logged in on this device ({SESSION_DAYS} days)", value=True)
-                if st.form_submit_button("Login", type="primary"):
-                    row = users[users["username"] == u.strip().lower()]
-                    if not row.empty and hmac.compare_digest(hash_pw(p, row.iloc[0]["salt"]), row.iloc[0]["hash"]):
-                        start_session(row.iloc[0]["username"], row.iloc[0]["role"] or "User", remember)
-                        st.rerun()
-                    st.error("Wrong username or password.")
-
-        with t_reg:
-            if not roles_open:
-                st.warning(f"Registration is closed: {MAX_ADMINS} Admin and {MAX_USERS} Users are already registered.")
-            else:
-                st.caption(f"Free places – Admin: {MAX_ADMINS - admins}, Users: {MAX_USERS - normal}")
-                with st.form("register"):
-                    role = st.radio("Register as", roles_open, horizontal=True, key="reg_role")
-                    u = st.text_input("Choose a username", key="reg_user")
-                    p1 = st.text_input("Password (min 6 characters)", type="password", key="reg_p1")
-                    p2 = st.text_input("Repeat password", type="password", key="reg_p2")
-                    need = "admin_code" if role == "Admin" else "registration_code"
-                    code = st.text_input(f"{'Admin' if role == 'Admin' else 'Registration'} code", type="password",
-                                         key="reg_code") if secrets_has(need) else ""
-                    if st.form_submit_button("Create account", type="primary"):
-                        u = u.strip().lower()
-                        fresh = read_users()                     # re-check right before saving
-                        f_admins = int((fresh["role"] == "Admin").sum())
-                        full = f_admins >= MAX_ADMINS if role == "Admin" else len(fresh) - f_admins >= MAX_USERS
-                        if secrets_has(need) and code != st.secrets[need]:
-                            st.error("Wrong code.")
-                        elif not re.fullmatch(r"[a-z0-9_.-]{3,20}", u):
-                            st.error("Username: 3-20 letters, numbers, _ . -")
-                        elif len(p1) < 6 or p1 != p2:
-                            st.error("Passwords must match and be at least 6 characters.")
-                        elif full:
-                            st.error(f"No free {role} place left.")
-                        elif u in fresh["username"].values:
-                            st.error("That username is taken.")
-                        else:
-                            salt = pysecrets.token_hex(16)
-                            new = pd.DataFrame([{"username": u, "role": role, "salt": salt, "hash": hash_pw(p1, salt),
-                                                 "created": datetime.now().isoformat(timespec="seconds")}])
-                            get_store().write("users", pd.concat([fresh, new], ignore_index=True))
-                            start_session(u, role, True)
-                            st.rerun()
-    st.stop()
-
-
-# ───────────────────────────── pages ─────────────────────────────
-def fmt_cfg(**extra):
-    num = st.column_config.NumberColumn
-    cfg = {
-        "month": None,
-        "item": st.column_config.TextColumn("Item"),
-        "group": st.column_config.TextColumn("Item"),
-        "size": st.column_config.TextColumn("Size"),
-        "category": st.column_config.TextColumn("Category"),
-        "unit": st.column_config.TextColumn("Unit"),
-        "open_qty": num("Opening Qty", format="%.2f"),
-        "open_value": num("Opening Value", format="%.2f"),
-        "purch_qty": num("Purchased Qty", format="%.2f"),
-        "purch_value": num("Purchased Value", format="%.2f"),
-        "available": num("Available Qty", format="%.2f"),
-        "avg_cost": num("Avg Cost", format="%.2f"),
-        "closing_qty": num("Closing Qty", format="%.2f"),
-        "closing_value": num("Closing Value", format="%.2f"),
-        "sold_qty": num("SOLD Qty", format="%.2f"),
-        "sold_value": num("SOLD Value (cost)", format="%.2f"),
-        "sell_price": num("Selling Price", format="%.2f"),
-        "sales_value": num("Sales Value", format="%.2f"),
-        "margin": num("Margin", format="%.2f"),
-        "status": st.column_config.TextColumn("Status"),
-    }
-    cfg.update(extra)
-    return cfg
-
-
-def need_setup():
-    st.info("Start in **⚙️ Setup**: import your Excel file, or add items and enter the opening stock.")
-
-
-def page_report():
-    st.header("📊 Monthly Report")
-    months = available_months()
-    if not months:
-        return need_setup()
-    m = st.selectbox("Month", months[::-1])
-    full = compute(m)
-    df = full[full["month"] == m]
-
-    f1, f2 = st.columns(2)
-    cats = sorted(df["category"].unique())
-    pick = f1.multiselect("Category", cats)
-    q = f2.text_input("Search item")
-    if pick:
-        df = df[df["category"].isin(pick)]
-    if q:
-        df = df[df["item"].str.contains(q, case=False, na=False)]
-
-    k = st.columns(5)
-    k[0].metric("Opening value", f"{df['open_value'].sum():,.0f}")
-    k[1].metric("Purchases", f"{df['purch_value'].sum():,.0f}")
-    k[2].metric("Closing value", f"{df['closing_value'].sum():,.0f}")
-    k[3].metric("Sold (at cost)", f"{df['sold_value'].sum():,.0f}")
-    k[4].metric("Sales value", f"{df['sales_value'].sum():,.0f}" if df["sales_value"].notna().any() else "–")
-
-    if (df["status"] == "Open month").any():
-        st.info("This month has no stock take yet, so Sold is blank. Do it in **Month-End Stock Take**.")
-    if (df["status"] == "Not counted").any():
-        st.warning(f"{(df['status'] == 'Not counted').sum()} item(s) with stock were not counted.")
-    if df["status"].str.startswith("Check").any():
-        st.error("Some counts are higher than Opening + Purchases (negative sold). "
-                 "Check missing purchases or count mistakes:  "
-                 + ", ".join(df.loc[df["status"].str.startswith("Check"), "item"]))
-
-    cols = ["group", "size", "category", "open_qty", "purch_qty", "closing_qty", "sold_qty", "avg_cost",
-            "sold_value", "closing_value", "sales_value", "margin", "status"]
-    st.dataframe(df[cols], hide_index=True, width="stretch", column_config=fmt_cfg(), height=520)
-
-    with st.expander("🧮 Totals by item group (e.g. all Water sizes together)"):
-        g = df.groupby("group", sort=False)[["open_value", "purch_value", "closing_value", "sold_value"]].sum()
-        st.dataframe(g, width="stretch", column_config={c: st.column_config.NumberColumn(format="%.2f") for c in g.columns})
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        df.drop(columns=["month"]).to_excel(xw, sheet_name=m, index=False)
-        full.to_excel(xw, sheet_name="All months", index=False)
-    st.download_button("⬇️ Download Excel", buf.getvalue(), file_name=f"inventory_{m}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    top = df.dropna(subset=["sold_value"]).nlargest(15, "sold_value")
-    if not top.empty:
-        st.subheader("Top 15 items by sold value")
-        st.bar_chart(top.set_index("item")["sold_value"])
-
-    with st.expander("📈 Month-by-month trend"):
-        what = st.radio("Show", ["sold_qty", "sold_value", "purch_value"], horizontal=True,
-                        format_func=lambda x: {"sold_qty": "Sold qty", "sold_value": "Sold value",
-                                               "purch_value": "Purchased value"}[x])
-        st.dataframe(full.pivot_table(index="item", columns="month", values=what, aggfunc="sum"),
-                     width="stretch")
-
-
-def last_prices():
-    p = load("purchases").sort_values("date")
-    prices = load("openings").set_index("item")["unit_price"].dropna().to_dict()
-    prices.update(p.groupby("item")["unit_price"].last().dropna().to_dict())
-    return prices
-
-
-def page_purchases():
-    st.header("🛒 Purchases")
-    items = load("items")
-    if items.empty:
-        return need_setup()
-    names = items["item"].tolist()
-    t1, t2 = st.tabs(["➕ Add purchases", "🧾 Purchase log"])
-
-    with t1:
-        st.caption("Add one row per item received. Leave **Unit price** blank to use the last known price.")
-        start = pd.DataFrame({"date": [date.today()], "item": [None], "qty": [None],
-                              "unit_price": [None], "supplier": [""]})
-        new = st.data_editor(
-            start, num_rows="dynamic", hide_index=True, width="stretch", key=f"padd_{ver()}",
-            column_config={
-                "date": st.column_config.DateColumn("Date", required=True),
-                "item": st.column_config.SelectboxColumn("Item", options=names, required=True),
-                "qty": st.column_config.NumberColumn("Qty", min_value=0.0, format="%.2f"),
-                "unit_price": st.column_config.NumberColumn("Unit price", min_value=0.0, format="%.2f"),
-                "supplier": st.column_config.TextColumn("Supplier"),
-            })
-        if st.button("Save purchases", type="primary"):
-            new = new.dropna(subset=["item"])
-            new = new[new["qty"].fillna(0) > 0]
-            if new.empty:
-                st.warning("Nothing to save – pick an item and a quantity.")
-            else:
-                lp = last_prices()
-                new = new.copy()
-                new["date"] = pd.to_datetime(new["date"]).dt.strftime("%Y-%m-%d").fillna(str(date.today()))
-                new["month"] = new["date"].str[:7]
-                new["unit_price"] = [p if pd.notna(p) else lp.get(i, 0.0) for i, p in zip(new["item"], new["unit_price"])]
-                new["note"] = ""
-                new["entered_by"] = st.session_state["user"]
-                save("purchases", pd.concat([load("purchases"), new], ignore_index=True))
-                st.success(f"Saved {len(new)} purchase line(s).")
-                st.rerun()
-
-    with t2:
-        p = load("purchases")
-        if p.empty:
-            st.info("No purchases yet.")
-        else:
-            months = sorted(p["month"].unique(), reverse=True)
-            m = st.selectbox("Month", months)
-            sub = p[p["month"] == m].copy()
-            sub["date"] = pd.to_datetime(sub["date"]).dt.date
-            ed = st.data_editor(
-                sub.drop(columns=["month"]), num_rows="dynamic", hide_index=True, width="stretch",
-                key=f"plog_{m}_{ver()}",
-                column_config={
-                    "date": st.column_config.DateColumn("Date", required=True),
-                    "item": st.column_config.SelectboxColumn("Item", options=names, required=True),
-                    "qty": st.column_config.NumberColumn("Qty", format="%.2f"),
-                    "unit_price": st.column_config.NumberColumn("Unit price", format="%.2f"),
-                    "supplier": "Supplier", "note": "Note", "entered_by": "Entered by"},
-                disabled=["entered_by"])
-            st.metric("Total purchased this month", f"{(ed['qty'].fillna(0) * ed['unit_price'].fillna(0)).sum():,.2f}")
-            if st.button("Save changes to this month"):
-                ed = ed.dropna(subset=["item"]).copy()
-                ed["date"] = pd.to_datetime(ed["date"]).dt.strftime("%Y-%m-%d")
-                ed["month"] = ed["date"].str[:7]
-                save("purchases", pd.concat([p[p["month"] != m], ed], ignore_index=True))
-                st.success("Updated.")
-                st.rerun()
-
-
-def page_stock_take():
-    st.header("📋 Month-End Stock Take")
-    months = available_months()
-    if not months:
-        return need_setup()
-    default = max(len(months) - 2, 0) if len(months) > 1 else 0   # usually the month that just ended
-    m = st.selectbox("Month being closed", months[::-1], index=len(months) - 1 - default)
-    cur = compute(m)
-    cur = cur[cur["month"] == m].copy()
-    counts = load("counts")
-    saved = counts[counts["month"] == m].set_index("item")["closing_qty"]
-    cur["counted"] = cur["item"].map(saved)
-    table = cur[["item", "category", "unit", "open_qty", "purch_qty", "available", "counted"]]
-
-    st.caption("Enter the quantity physically left on the shelf in **Counted**. "
-               "Items with no stock at all don't need to be entered.")
-    ed = st.data_editor(
-        table, hide_index=True, width="stretch", height=520, key=f"take_{m}_{ver()}",
-        disabled=["item", "category", "unit", "open_qty", "purch_qty", "available"],
-        column_config={
-            "item": "Item", "category": "Category", "unit": "Unit",
-            "open_qty": st.column_config.NumberColumn("Opening", format="%.2f"),
-            "purch_qty": st.column_config.NumberColumn("Purchased", format="%.2f"),
-            "available": st.column_config.NumberColumn("Expected (Opening + Purchased)", format="%.2f"),
-            "counted": st.column_config.NumberColumn("✏️ Counted", min_value=0.0, format="%.2f"),
-        })
-
-    est = ed.merge(cur[["item", "avg_cost"]], on="item")
-    done = est.dropna(subset=["counted"]).copy()
-    done["sold"] = done["available"] - done["counted"]
-    c = st.columns(3)
-    c[0].metric("Items counted", f"{len(done)} / {(est['available'] > 0).sum()} with stock")
-    c[1].metric("Estimated sold (cost)", f"{(done['sold'] * done['avg_cost']).sum():,.0f}")
-    neg = done[done["sold"] < -1e-9]
-    if not neg.empty:
-        st.warning("Counted more than expected (missing purchase?): " + ", ".join(neg["item"]))
-
-    if st.button("💾 Save stock take", type="primary"):
-        new = done[["item", "counted"]].rename(columns={"counted": "closing_qty"})
-        new.insert(0, "month", m)
-        new["counted_by"] = st.session_state["user"]
-        save("counts", pd.concat([counts[counts["month"] != m], new], ignore_index=True))
-        st.success(f"Stock take for {m} saved. Next month's opening stock is now set.")
-        st.rerun()
-
-
-def flash():
-    msg = st.session_state.pop("flash", None)
-    if msg:
-        st.success(msg)
-
-
-def item_picker(items, key):
-    """Two drop-downs: Item (group, e.g. Water) -> Size (500ml / 1l / 1.5ml / 5l). Returns the full item name."""
-    it = items.assign(_g=items["group"].where(items["group"] != "", items["item"]))
-    groups = list(dict.fromkeys(it["_g"]))
-    c1, c2 = st.columns(2)
-    g = c1.selectbox("Item", groups, key=f"{key}_group")
-    sub = it[it["_g"] == g].reset_index(drop=True)
-    labels = [sz or "— (no size)" for sz in sub["size"]]
-    i = c2.selectbox("Size", range(len(sub)), format_func=lambda k: labels[k], key=f"{key}_size_{g}")
-    return sub.loc[i, "item"]
-
-
-def month_end_entry(items):
-    months = available_months()
-    if items.empty or not months:
-        return need_setup()
-    m = st.selectbox("Month being closed", months[::-1], index=1 if len(months) > 1 else 0, key="ae_month")
-    cur = compute(m)
-    cur = cur[cur["month"] == m].set_index("item")
-
-    name = item_picker(items, "ae")
-    r = cur.loc[name]
-    counts = load("counts")
-    mine = counts[(counts["month"] == m) & (counts["item"] == name)]
-    saved = float(mine["closing_qty"].iloc[0]) if not mine.empty else None
-
-    c = st.columns(4)
-    c[0].metric("Opening stock", f"{r['open_qty']:,.2f}")
-    c[1].metric("Purchased this month", f"{r['purch_qty']:,.2f}")
-    c[2].metric("Expected in stock", f"{r['available']:,.2f}")
-    c[3].metric("Already entered", "–" if saved is None else f"{saved:,.2f}")
-
-    qty = st.number_input("Closing stock – quantity left on the shelf", min_value=0.0, value=saved, step=1.0,
-                          format="%.2f", placeholder="Type the counted quantity", key=f"ae_qty_{m}_{name}_{ver()}")
-    if qty is not None:
-        sold = r["available"] - qty
-        p = st.columns(2)
-        p[0].metric("Sold quantity", f"{sold:,.2f}")
-        p[1].metric("Sold value (at cost)", f"{sold * r['avg_cost']:,.2f}")
-        if sold < 0:
-            st.warning("Counted more than Opening + Purchases. Check the count or a missing purchase.")
-
-    if st.button("💾 Save closing stock", type="primary", disabled=qty is None):
-        row = pd.DataFrame([{"month": m, "item": name, "closing_qty": qty, "counted_by": st.session_state["user"]}])
-        save("counts", pd.concat([counts[~((counts["month"] == m) & (counts["item"] == name))], row],
-                                 ignore_index=True))
-        st.session_state["flash"] = f"Saved: {name} – closing stock {qty:,.2f} for {m}."
-        st.rerun()
-
-    st.divider()
-    counts = load("counts")
-    month_counts = counts[counts["month"] == m]
-    stocked = cur[cur["available"] > 0]
-    entered = stocked.index.isin(month_counts["item"])
-    st.progress(float(entered.mean()) if len(stocked) else 1.0,
-                text=f"{int(entered.sum())} of {len(stocked)} items with stock entered for {m}")
-    with st.expander("✅ Entered this month"):
-        done = month_counts.merge(cur[["available", "avg_cost"]].reset_index(), on="item", how="left")
-        done["sold_qty"] = done["available"] - done["closing_qty"]
-        st.dataframe(done[["item", "closing_qty", "available", "sold_qty", "counted_by"]], hide_index=True,
-                     width="stretch", column_config={
-                         "item": "Item", "closing_qty": st.column_config.NumberColumn("Closing", format="%.2f"),
-                         "available": st.column_config.NumberColumn("Expected", format="%.2f"),
-                         "sold_qty": st.column_config.NumberColumn("Sold", format="%.2f"),
-                         "counted_by": "Entered by"})
-        rm = st.multiselect("Remove entries (to re-enter them)", done["item"].tolist(), key=f"ae_rm_{ver()}")
-        if rm and st.button("Remove selected"):
-            save("counts", counts[~((counts["month"] == m) & counts["item"].isin(rm))])
-            st.rerun()
-    with st.expander("⏳ Still to enter"):
-        todo = stocked[~entered].reset_index()[["item", "available"]]
-        st.dataframe(todo, hide_index=True, width="stretch", column_config={
-            "item": "Item", "available": st.column_config.NumberColumn("Expected in stock", format="%.2f")})
-
-
-def new_item_form(items):
-    it = items.assign(_g=items["group"].where(items["group"] != "", items["item"]))
-    groups = list(dict.fromkeys(it["_g"]))
-    cats = sorted(c for c in items["category"].unique() if c)
-    NEW_G, NEW_C = "➕ New item group…", "➕ New category…"
-    st.caption("Add an item that is not in the list yet. To add another size of an existing item "
-               "(e.g. Water 2l), pick the group and type the new size.")
-    with st.form("new_item", clear_on_submit=True):
-        g_sel = st.selectbox("Item group", [NEW_G] + groups)
-        g_new = st.text_input("New group name (only if you chose “New item group”)", placeholder="e.g. Sprite")
-        size = st.text_input("Size / variant (leave blank if none)", placeholder="e.g. 500ml, 1l, Small")
-        c_sel = st.selectbox("Category", cats + [NEW_C])
-        c_new = st.text_input("New category name (only if you chose “New category”)")
-        u1, u2 = st.columns(2)
-        unit = u1.text_input("Unit", placeholder="kg, bottle, pkt …")
-        sell = u2.number_input("Selling price (optional)", min_value=0.0, value=None, format="%.2f")
-        st.markdown("**Stock you already have of this item (optional)**")
-        q1, q2 = st.columns(2)
-        qty_now = q1.number_input("Quantity in stock now", min_value=0.0, value=None, format="%.2f")
-        price_now = q2.number_input("Unit price (cost)", min_value=0.0, value=None, format="%.2f")
-        if st.form_submit_button("➕ Add item", type="primary"):
-            group = g_new.strip() if g_sel == NEW_G else g_sel
-            cat = c_new.strip() if c_sel == NEW_C else c_sel
-            name = f"{group} {size.strip()}".strip()
-            if not group:
-                st.error("Choose an item group or type a new one.")
-            elif name in items["item"].values:
-                st.error(f"'{name}' already exists.")
-            elif (qty_now or 0) > 0 and price_now is None:
-                st.error("Enter the unit price for the stock you already have.")
-            else:
-                row = pd.DataFrame([{"item": name, "group": group, "size": size.strip(), "category": cat,
-                                     "unit": unit.strip(), "sell_price": sell}])
-                save("items", pd.concat([items, row], ignore_index=True))
-                if (qty_now or 0) > 0:                         # existing stock is recorded as a purchase today
-                    today = date.today()
-                    pur = pd.DataFrame([{"date": str(today), "month": today.strftime("%Y-%m"), "item": name,
-                                         "qty": qty_now, "unit_price": price_now, "supplier": "",
-                                         "note": "Opening balance (new item)", "entered_by": st.session_state["user"]}])
-                    save("purchases", pd.concat([load("purchases"), pur], ignore_index=True))
-                st.session_state["flash"] = f"Item added: {name}"
-                st.rerun()
-
-
-def page_add_item():
-    st.header("➕ Add Item")
-    flash()
-    items = load("items")
-    t1, t2 = st.tabs(["📋 Month-end stock entry", "🆕 New item"])
-    with t1:
-        month_end_entry(items)
-    with t2:
-        new_item_form(items)
-
-
-def page_setup():
-    st.header("⚙️ Setup")
-    admin = is_admin()
-    tabs = st.tabs(["📦 Items"] + (["🏁 Opening stock", "📥 Import from Excel", "👥 Users"] if admin else []))
-    t1 = tabs[0]
-
-    with t1:
-        st.caption("Add / edit items. **Selling price** is optional (for drinks etc.) – it enables Sales value & Margin. "
-                   "⚠️ Renaming an item disconnects it from its past records.")
-        items = load("items")
-        ed = st.data_editor(items, num_rows="dynamic", hide_index=True, width="stretch",
-                            key=f"items_{ver()}",
-                            column_config={"item": st.column_config.TextColumn("Item (full name)", required=True),
-                                           "group": "Group (e.g. Water)", "size": "Size (e.g. 500ml)",
-                                           "category": "Category", "unit": "Unit",
-                                           "sell_price": st.column_config.NumberColumn("Selling price", min_value=0.0)})
-        if st.button("Fill blank Group / Size from item names"):
-            ed = clean("items", ed)
-            for i, r in ed.iterrows():
-                g, sz = split_group_size(r["item"])
-                ed.loc[i, "group"] = r["group"] or g
-                ed.loc[i, "size"] = r["size"] or sz
-            save("items", ed)
-            st.rerun()
-        if st.button("Save items", type="primary"):
-            ed = clean("items", ed)
-            dup = ed[ed["item"].duplicated()]["item"].tolist()
-            if dup:
-                st.error("Duplicate item names: " + ", ".join(dup))
-            else:
-                save("items", ed)
-                st.success("Items saved.")
-                st.rerun()
-
-    if not admin:
-        st.info("Opening stock, Excel import and user management are available to the Admin only.")
-        return
-    t2, t3, t4 = tabs[1:]
-    with t4:
-        users_admin()
-
-    with t2:
-        items = load("items")
-        if items.empty:
-            st.info("Add items first.")
-        else:
-            op = load("openings")
-            cur_month = baseline_month() or date.today().strftime("%Y-%m")
-            d = st.date_input("Opening stock is as at the start of month", pd.Period(cur_month).start_time.date())
-            month = d.strftime("%Y-%m")
-            base = items[["item"]].merge(op[op["month"] == cur_month][["item", "qty", "unit_price"]], how="left", on="item")
-            ed = st.data_editor(base, hide_index=True, width="stretch", disabled=["item"], height=480,
-                                key=f"open_{ver()}",
-                                column_config={"qty": st.column_config.NumberColumn("Opening Qty", min_value=0.0),
-                                               "unit_price": st.column_config.NumberColumn("Unit price", min_value=0.0)})
-            st.warning("This is only for the very first month you use the system. "
-                       "After that opening stock carries forward automatically.")
-            if st.button("Save opening stock", type="primary"):
-                ed = ed.copy()
-                ed[["qty", "unit_price"]] = ed[["qty", "unit_price"]].fillna(0)
-                ed.insert(0, "month", month)
-                save("openings", ed)
-                st.success("Opening stock saved.")
-                st.rerun()
-
-    with t3:
-        st.caption("Upload your existing report (Opening / Purchases / Closing Stock columns per month). "
-                   "It will create items, opening stock, purchases and month-end counts.")
-        up = st.file_uploader("Inventory report (.xlsx)", type=["xlsx"])
-        if up:
-            try:
-                data, warns = parse_legacy_excel(up)
-            except Exception as e:
-                st.error(f"Could not read the file: {e}")
-                return
-            st.write({k: len(v) for k, v in data.items()})
-            st.dataframe(data["items"], hide_index=True, height=250, width="stretch")
-            if warns:
-                with st.expander(f"⚠️ {len(warns)} things to review"):
-                    st.write("\n".join(f"- {w}" for w in warns))
-            ok = st.checkbox("Replace ALL existing data with this import")
-            if st.button("Import", type="primary", disabled=not ok):
-                for t, df in data.items():
-                    save(t, df)
-                st.success("Imported. Category names were guessed – fix them under 📦 Items if needed.")
-                st.rerun()
-
-
-# ───────────────────────────── main ─────────────────────────────
-STYLE = """
+st.markdown("""
 <style>
-.block-container {padding-top: 1.6rem;}
-div[data-testid="stMetric"] {background: rgba(128,128,128,.08); border: 1px solid rgba(128,128,128,.25);
-                             border-radius: 10px; padding: 10px 14px;}
-.app-banner {background: linear-gradient(90deg,#1f4e79,#2e75b6); color: #fff; padding: 14px 22px;
-             border-radius: 12px; margin-bottom: 1rem; font-size: 1.35rem; font-weight: 600;}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+html,body,[class*="css"]{font-family:Inter,sans-serif}
+.stApp{background:#f5f7fb}
+.block-container{max-width:1550px;padding-top:1rem}
+[data-testid="stSidebar"]{background:#111827}
+[data-testid="stSidebar"] *{color:#f9fafb!important}
+h1,h2,h3{color:#111827}
+.pos-card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:18px;box-shadow:0 4px 18px rgba(17,24,39,.05)}
+.pos-title{font-size:2rem;font-weight:800}
+.pos-sub{color:#6b7280;margin-bottom:1rem}
+.kpi-label{font-size:.78rem;color:#6b7280;font-weight:600}
+.kpi-value{font-size:1.5rem;font-weight:800;color:#111827}
+.badge{display:inline-block;padding:5px 9px;border-radius:999px;font-size:.72rem;font-weight:700}
 </style>
-"""
+""", unsafe_allow_html=True)
 
+def conn():
+    c=sqlite3.connect(DB, check_same_thread=False)
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
 
-def main():
-    try:
-        get_store()
-    except Exception as e:
-        st.error("Could not connect to your Google Sheet. Check that (1) the service-account details are in "
-                 "Streamlit **Secrets** under `[gcp_service_account]`, (2) the Sheet is shared with the "
-                 "service account's `client_email` as **Editor**, and (3) the Google Sheets and Drive APIs are enabled.")
-        st.exception(e)
-        st.stop()
+def q(sql,p=()):
+    c=conn(); d=pd.read_sql_query(sql,c,params=p); c.close(); return d
 
-    st.markdown(STYLE, unsafe_allow_html=True)
-    emit_cookie()
-    auth_gate()
+def x(sql,p=()):
+    c=conn(); c.execute(sql,p); c.commit(); c.close()
 
-    st.markdown("<div class='app-banner'>🍽️ Restaurant Inventory Management System</div>", unsafe_allow_html=True)
-    with st.sidebar:
-        st.title("Menu")
-        page = st.radio("Menu", ["📊 Monthly Report", "➕ Add Item", "🛒 Purchases", "📋 Month-End Stock Take", "⚙️ Setup"],
-                        label_visibility="collapsed")
-        st.divider()
-        st.write(f"👤 **{st.session_state['user']}**  ·  {st.session_state['role']}")
-        with st.expander("🔒 Change password"):
-            with st.form("chpw", clear_on_submit=True):
-                old = st.text_input("Current password", type="password")
-                n1 = st.text_input("New password", type="password")
-                n2 = st.text_input("Repeat new password", type="password")
-                if st.form_submit_button("Change"):
-                    err = change_password(old, n1, n2)
-                    st.error(err) if err else st.success("Password changed.")
-        if st.button("Logout"):
-            logout()
-        st.caption(f"Storage: {get_store().label}")
-        if st.button("🔄 Refresh data"):
-            _load.clear()
-            st.rerun()
+def pw(v): return hashlib.sha256(v.encode()).hexdigest()
+def money(v): return f"Rs. {float(v):,.2f}"
 
-    {"📊 Monthly Report": page_report, "➕ Add Item": page_add_item, "🛒 Purchases": page_purchases,
-     "📋 Month-End Stock Take": page_stock_take, "⚙️ Setup": page_setup}[page]()
+def init():
+    c=conn(); cur=c.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT,
+      full_name TEXT, role TEXT, active INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS suppliers(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact TEXT,
+      phone TEXT, email TEXT, address TEXT, active INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS categories(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE);
+    CREATE TABLE IF NOT EXISTS items(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, item_name TEXT,
+      sub_category TEXT, unit TEXT, reorder_level REAL DEFAULT 0,
+      opening_qty REAL DEFAULT 0, opening_unit_cost REAL DEFAULT 0, active INTEGER DEFAULT 1,
+      FOREIGN KEY(category_id) REFERENCES categories(id));
+    CREATE TABLE IF NOT EXISTS purchase_orders(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, po_no TEXT UNIQUE, supplier_id INTEGER,
+      order_date TEXT, status TEXT DEFAULT 'Draft', notes TEXT, total REAL DEFAULT 0,
+      FOREIGN KEY(supplier_id) REFERENCES suppliers(id));
+    CREATE TABLE IF NOT EXISTS po_lines(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, po_id INTEGER, item_id INTEGER,
+      quantity REAL, unit_price REAL, received_qty REAL DEFAULT 0,
+      FOREIGN KEY(po_id) REFERENCES purchase_orders(id) ON DELETE CASCADE,
+      FOREIGN KEY(item_id) REFERENCES items(id));
+    CREATE TABLE IF NOT EXISTS purchases(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_date TEXT, supplier_id INTEGER,
+      item_id INTEGER, quantity REAL, unit_price REAL, po_id INTEGER, invoice_no TEXT,
+      FOREIGN KEY(supplier_id) REFERENCES suppliers(id), FOREIGN KEY(item_id) REFERENCES items(id));
+    CREATE TABLE IF NOT EXISTS stock_movements(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, movement_date TEXT, item_id INTEGER,
+      movement_type TEXT, quantity REAL, unit_cost REAL, reference TEXT, notes TEXT,
+      FOREIGN KEY(item_id) REFERENCES items(id));
+    CREATE TABLE IF NOT EXISTS wastage(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, waste_date TEXT, item_id INTEGER,
+      quantity REAL, reason TEXT, unit_cost REAL, notes TEXT,
+      FOREIGN KEY(item_id) REFERENCES items(id));
+    CREATE TABLE IF NOT EXISTS month_closing(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, month_key TEXT, item_id INTEGER,
+      closing_qty REAL, unit_cost REAL, stock_value REAL, closed_at TEXT,
+      UNIQUE(month_key,item_id), FOREIGN KEY(item_id) REFERENCES items(id));
+    """)
+    if not cur.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+        cur.execute("INSERT INTO users(username,password,full_name,role) VALUES(?,?,?,?)",
+                    ("admin",pw("admin123"),"System Administrator","Admin"))
+    c.commit(); c.close()
+init()
 
+def login():
+    st.markdown("<div style='max-width:470px;margin:7rem auto'><div class='pos-card'>",unsafe_allow_html=True)
+    st.markdown("## 🍽️ Restaurant POS")
+    st.caption("Inventory & Purchasing Management")
+    u=st.text_input("Username")
+    p=st.text_input("Password",type="password")
+    if st.button("Sign in",type="primary",use_container_width=True):
+        d=q("SELECT * FROM users WHERE username=? AND password=? AND active=1",(u,pw(p)))
+        if not d.empty:
+            st.session_state.user=d.iloc[0].to_dict(); st.rerun()
+        else: st.error("Invalid username or password.")
+    st.info("Default administrator: admin / admin123")
+    st.markdown("</div></div>",unsafe_allow_html=True)
 
-main()
+if "user" not in st.session_state:
+    login(); st.stop()
+
+user=st.session_state.user
+role=user["role"]
+
+def allowed(roles):
+    return role in roles
+
+st.sidebar.markdown("### 🍽️ Restaurant POS")
+st.sidebar.caption(f"{user['full_name']} • {role}")
+menus=["Dashboard","Purchases","Purchase Orders","Stock Intake","Wastage","Month-End Closing","Inventory","Stock Movements","Suppliers","Item Master","Reports"]
+page=st.sidebar.radio("NAVIGATION",menus)
+if st.sidebar.button("Logout",use_container_width=True):
+    del st.session_state.user; st.rerun()
+
+today=date.today()
+month_default=today.replace(day=1)
+
+# DASHBOARD
+if page=="Dashboard":
+    st.markdown("<div class='pos-title'>Operations Dashboard</div><div class='pos-sub'>Purchasing, stock, consumption and month-end position</div>",unsafe_allow_html=True)
+    m=st.date_input("Reporting month",month_default,key="dashmonth").strftime("%Y-%m")
+    vals=[]
+    vals.append(q("SELECT COUNT(*) n FROM items WHERE active=1").iloc[0,0])
+    vals.append(q("SELECT COALESCE(SUM(quantity*unit_price),0) v FROM purchases WHERE substr(purchase_date,1,7)=?",(m,)).iloc[0,0])
+    vals.append(q("SELECT COALESCE(SUM(quantity*unit_cost),0) v FROM wastage WHERE substr(waste_date,1,7)=?",(m,)).iloc[0,0])
+    vals.append(q("SELECT COALESCE(SUM(stock_value),0) v FROM month_closing WHERE month_key=?",(m,)).iloc[0,0])
+    cols=st.columns(4)
+    labels=[("Active Items",str(vals[0])),("Monthly Purchases",money(vals[1])),("Wastage Value",money(vals[2])),("Closing Stock Value",money(vals[3]))]
+    for c,(a,b) in zip(cols,labels):
+        with c: st.markdown(f"<div class='pos-card'><div class='kpi-label'>{a}</div><div class='kpi-value'>{b}</div></div>",unsafe_allow_html=True)
+    st.markdown("### Purchase Trend")
+    trend=q("""SELECT substr(purchase_date,1,7) month,SUM(quantity*unit_price) total
+               FROM purchases GROUP BY month ORDER BY month DESC LIMIT 12""").sort_values("month")
+    if not trend.empty:
+        st.line_chart(trend.set_index("month")["total"])
+    c1,c2=st.columns(2)
+    with c1:
+        st.markdown("### Top Purchased Items")
+        top=q("""SELECT i.item_name||' - '||i.sub_category item,
+                 SUM(p.quantity) qty,SUM(p.quantity*p.unit_price) value
+                 FROM purchases p JOIN items i ON i.id=p.item_id
+                 WHERE substr(p.purchase_date,1,7)=?
+                 GROUP BY p.item_id ORDER BY value DESC LIMIT 10""",(m,))
+        st.dataframe(top,use_container_width=True,hide_index=True)
+    with c2:
+        st.markdown("### Recent Stock Movements")
+        recent=q("""SELECT sm.movement_date Date,i.item_name Item,i.sub_category "Sub-category",
+                    sm.movement_type Type,sm.quantity Quantity,sm.reference Reference
+                    FROM stock_movements sm JOIN items i ON i.id=sm.item_id
+                    ORDER BY sm.id DESC LIMIT 10""")
+        st.dataframe(recent,use_container_width=True,hide_index=True)
+
+# SUPPLIERS
+elif page=="Suppliers":
+    st.markdown("<div class='pos-title'>Supplier Management</div><div class='pos-sub'>Maintain supplier contacts and purchasing relationships.</div>",unsafe_allow_html=True)
+    with st.form("supplier"):
+        a,b,c=st.columns(3)
+        with a: name=st.text_input("Supplier Name *"); contact=st.text_input("Contact Person")
+        with b: phone=st.text_input("Phone"); email=st.text_input("Email")
+        with c: address=st.text_area("Address")
+        if st.form_submit_button("Add Supplier",type="primary"):
+            if name.strip():
+                x("INSERT INTO suppliers(name,contact,phone,email,address) VALUES(?,?,?,?,?)",(name,contact,phone,email,address)); st.success("Supplier added.")
+    st.dataframe(q("SELECT id ID,name Supplier,contact Contact,phone Phone,email Email,address Address FROM suppliers ORDER BY name"),use_container_width=True,hide_index=True)
+
+# ITEM MASTER
+elif page=="Item Master":
+    st.markdown("<div class='pos-title'>Item Master</div><div class='pos-sub'>Manage item hierarchy, pack sizes, units and reorder levels.</div>",unsafe_allow_html=True)
+    with st.form("item"):
+        a,b,c=st.columns(3)
+        with a:
+            cat=st.text_input("Category *",placeholder="Beverages")
+            item=st.text_input("Item *",placeholder="Water")
+        with b:
+            sub=st.text_input("Sub-category / Pack Size *",placeholder="1L")
+            unit=st.selectbox("Unit",["Bottle","Can","Packet","Box","Kg","g","L","ml","Piece"])
+        with c:
+            reorder=st.number_input("Reorder Level",min_value=0.0)
+            opening=st.number_input("Opening Quantity",min_value=0.0)
+            cost=st.number_input("Opening Unit Cost (Rs.)",min_value=0.0)
+        if st.form_submit_button("Add Item",type="primary"):
+            x("INSERT OR IGNORE INTO categories(name) VALUES(?)",(cat,))
+            cid=q("SELECT id FROM categories WHERE name=?",(cat,)).iloc[0,0]
+            x("""INSERT INTO items(category_id,item_name,sub_category,unit,reorder_level,opening_qty,opening_unit_cost)
+                 VALUES(?,?,?,?,?,?,?)""",(cid,item,sub,unit,reorder,opening,cost))
+            st.success("Item added.")
+    st.dataframe(q("""SELECT i.id ID,c.name Category,i.item_name Item,i.sub_category "Sub-category",
+                      i.unit Unit,i.reorder_level "Reorder Level",i.opening_qty "Opening Qty"
+                      FROM items i LEFT JOIN categories c ON c.id=i.category_id
+                      ORDER BY c.name,i.item_name,i.sub_category"""),use_container_width=True,hide_index=True)
+
+# PURCHASES
+elif page=="Purchases":
+    st.markdown("<div class='pos-title'>Monthly Purchases</div><div class='pos-sub'>Record received purchases. Each saved purchase creates a stock movement automatically.</div>",unsafe_allow_html=True)
+    items=q("""SELECT i.id,c.name category,i.item_name,i.sub_category,i.unit
+               FROM items i LEFT JOIN categories c ON c.id=i.category_id WHERE i.active=1
+               ORDER BY category,item_name,sub_category""")
+    suppliers=q("SELECT id,name FROM suppliers WHERE active=1 ORDER BY name")
+    if items.empty or suppliers.empty: st.warning("Create items and suppliers first.")
+    else:
+        with st.form("purchase"):
+            a,b=st.columns(2)
+            with a:
+                d=st.date_input("Purchase Date",today)
+                sid=st.selectbox("Supplier",suppliers.id.tolist(),format_func=lambda z:suppliers.loc[suppliers.id==z,"name"].iloc[0])
+                invoice=st.text_input("Invoice No.")
+            with b:
+                iid=st.selectbox("Item",items.id.tolist(),format_func=lambda z:(lambda r:f"{r.category} • {r.item_name} • {r.sub_category} ({r.unit})")(items[items.id==z].iloc[0]))
+                qty=st.number_input("Quantity",min_value=.01)
+                price=st.number_input("Unit Price (Rs.)",min_value=0.0)
+            if st.form_submit_button("Save Purchase",type="primary"):
+                c=conn()
+                cur=c.cursor(); cur.execute("""INSERT INTO purchases(purchase_date,supplier_id,item_id,quantity,unit_price,invoice_no)
+                    VALUES(?,?,?,?,?,?)""",(d.isoformat(),sid,iid,qty,price,invoice))
+                ref=f"PUR-{cur.lastrowid}"
+                cur.execute("""INSERT INTO stock_movements(movement_date,item_id,movement_type,quantity,unit_cost,reference)
+                    VALUES(?,?,?,?,?,?)""",(d.isoformat(),iid,"PURCHASE",qty,price,ref))
+                c.commit(); c.close(); st.success("Purchase saved and stock movement posted.")
+        m=st.date_input("Month",month_default,key="pmonth").strftime("%Y-%m")
+        df=q("""SELECT p.purchase_date Date,s.name Supplier,i.item_name Item,i.sub_category "Sub-category",
+                i.unit Unit,p.quantity Quantity,p.unit_price "Unit Price",p.quantity*p.unit_price Total,p.invoice_no "Invoice No."
+                FROM purchases p JOIN items i ON i.id=p.item_id LEFT JOIN suppliers s ON s.id=p.supplier_id
+                WHERE substr(p.purchase_date,1,7)=? ORDER BY p.purchase_date DESC""",(m,))
+        st.dataframe(df,use_container_width=True,hide_index=True)
+
+# PURCHASE ORDERS
+elif page=="Purchase Orders":
+    st.markdown("<div class='pos-title'>Purchase Orders</div><div class='pos-sub'>Create and track supplier purchase orders before goods are received.</div>",unsafe_allow_html=True)
+    suppliers=q("SELECT id,name FROM suppliers WHERE active=1 ORDER BY name")
+    items=q("SELECT i.id,c.name category,i.item_name,i.sub_category,i.unit FROM items i LEFT JOIN categories c ON c.id=i.category_id WHERE i.active=1 ORDER BY category,item_name")
+    if suppliers.empty or items.empty: st.warning("Create suppliers and items first.")
+    else:
+        with st.form("po"):
+            a,b=st.columns(2)
+            with a: od=st.date_input("Order Date",today); sid=st.selectbox("Supplier",suppliers.id.tolist(),format_func=lambda z:suppliers.loc[suppliers.id==z,"name"].iloc[0])
+            with b: iid=st.selectbox("Item",items.id.tolist(),format_func=lambda z:(lambda r:f"{r.item_name} • {r.sub_category} ({r.unit})")(items[items.id==z].iloc[0])); qty=st.number_input("Ordered Quantity",min_value=.01); price=st.number_input("Unit Price",min_value=0.0)
+            notes=st.text_area("Notes")
+            if st.form_submit_button("Create Purchase Order",type="primary"):
+                c=conn(); cur=c.cursor(); stamp=datetime.now().strftime("%Y%m%d%H%M%S")
+                cur.execute("INSERT INTO purchase_orders(po_no,supplier_id,order_date,status,notes,total) VALUES(?,?,?,?,?,?)",
+                            (f"PO-{stamp}",sid,od.isoformat(),"Open",notes,qty*price))
+                pid=cur.lastrowid
+                cur.execute("INSERT INTO po_lines(po_id,item_id,quantity,unit_price) VALUES(?,?,?,?)",(pid,iid,qty,price))
+                c.commit(); c.close(); st.success(f"Purchase order PO-{stamp} created.")
+        st.dataframe(q("""SELECT po.po_no "PO No.",po.order_date Date,s.name Supplier,po.status Status,
+                          po.total Total,po.notes Notes FROM purchase_orders po LEFT JOIN suppliers s ON s.id=po.supplier_id
+                          ORDER BY po.id DESC"""),use_container_width=True,hide_index=True)
+
+# STOCK INTAKE
+elif page=="Stock Intake":
+    st.markdown("<div class='pos-title'>Stock Intake</div><div class='pos-sub'>Record non-purchase stock receipts, transfers or opening adjustments.</div>",unsafe_allow_html=True)
+    items=q("SELECT i.id,c.name category,i.item_name,i.sub_category,i.unit FROM items i LEFT JOIN categories c ON c.id=i.category_id WHERE i.active=1 ORDER BY category,item_name")
+    with st.form("intake"):
+        a,b=st.columns(2)
+        with a: d=st.date_input("Date",today); typ=st.selectbox("Movement",["INTAKE","TRANSFER_IN","ADJUSTMENT_IN"])
+        with b: iid=st.selectbox("Item",items.id.tolist(),format_func=lambda z:(lambda r:f"{r.item_name} • {r.sub_category} ({r.unit})")(items[items.id==z].iloc[0])); qty=st.number_input("Quantity",min_value=.01); cost=st.number_input("Unit Cost",min_value=0.0)
+        ref=st.text_input("Reference"); notes=st.text_area("Notes")
+        if st.form_submit_button("Post Stock Intake",type="primary"):
+            x("INSERT INTO stock_movements(movement_date,item_id,movement_type,quantity,unit_cost,reference,notes) VALUES(?,?,?,?,?,?,?)",(d.isoformat(),iid,typ,qty,cost,ref,notes)); st.success("Stock intake posted.")
+
+# WASTAGE
+elif page=="Wastage":
+    st.markdown("<div class='pos-title'>Wastage & Loss</div><div class='pos-sub'>Record spoilage, expiry, breakage and other inventory losses.</div>",unsafe_allow_html=True)
+    items=q("SELECT i.id,i.item_name,i.sub_category,i.unit FROM items i WHERE i.active=1 ORDER BY i.item_name")
+    with st.form("waste"):
+        a,b=st.columns(2)
+        with a: d=st.date_input("Waste Date",today); iid=st.selectbox("Item",items.id.tolist(),format_func=lambda z:(lambda r:f"{r.item_name} • {r.sub_category} ({r.unit})")(items[items.id==z].iloc[0])); qty=st.number_input("Quantity",min_value=.01)
+        with b: reason=st.selectbox("Reason",["Spoilage","Expired","Damaged","Breakage","Preparation Waste","Other"]); cost=st.number_input("Unit Cost (Rs.)",min_value=0.0)
+        notes=st.text_area("Notes")
+        if st.form_submit_button("Record Wastage",type="primary"):
+            c=conn(); cur=c.cursor(); cur.execute("INSERT INTO wastage(waste_date,item_id,quantity,reason,unit_cost,notes) VALUES(?,?,?,?,?,?)",(d.isoformat(),iid,qty,reason,cost,notes)); wid=cur.lastrowid
+            cur.execute("INSERT INTO stock_movements(movement_date,item_id,movement_type,quantity,unit_cost,reference,notes) VALUES(?,?,?,?,?,?,?)",(d.isoformat(),iid,"WASTAGE",-qty,cost,f"WST-{wid}",reason)); c.commit(); c.close(); st.success("Wastage recorded.")
+    m=st.date_input("Month",month_default,key="wmonth").strftime("%Y-%m")
+    st.dataframe(q("""SELECT w.waste_date Date,i.item_name Item,i.sub_category "Sub-category",w.quantity Quantity,
+                      w.reason Reason,w.unit_cost "Unit Cost",w.quantity*w.unit_cost "Loss Value"
+                      FROM wastage w JOIN items i ON i.id=w.item_id WHERE substr(w.waste_date,1,7)=?
+                      ORDER BY w.waste_date DESC""",(m,)),use_container_width=True,hide_index=True)
+
+# MONTH END
+elif page=="Month-End Closing":
+    st.markdown("<div class='pos-title'>Month-End Stock Closing</div><div class='pos-sub'>Closing stock becomes the next month's opening stock. Quantity × weighted unit cost = closing value.</div>",unsafe_allow_html=True)
+    m=st.date_input("Closing Month",month_default,key="closemonth")
+    mk=m.strftime("%Y-%m")
+    items=q("SELECT i.*,c.name category FROM items i LEFT JOIN categories c ON c.id=i.category_id WHERE i.active=1 ORDER BY category,item_name,sub_category")
+    rows=[]
+    for _,r in items.iterrows():
+        # Opening is previous closing if available; otherwise master opening.
+        prev=(pd.to_numeric(q("SELECT closing_qty FROM month_closing WHERE item_id=? AND month_key<? ORDER BY month_key DESC LIMIT 1",(r.id,mk)).iloc[:,0],errors="coerce").iloc[0] if not q("SELECT closing_qty FROM month_closing WHERE item_id=? AND month_key<? ORDER BY month_key DESC LIMIT 1",(r.id,mk)).empty else r.opening_qty)
+        pur=q("SELECT COALESCE(SUM(quantity),0) q,COALESCE(SUM(quantity*unit_price),0) v FROM purchases WHERE item_id=? AND substr(purchase_date,1,7)=?",(r.id,mk)).iloc[0]
+        moves=q("SELECT COALESCE(SUM(CASE WHEN quantity>0 THEN quantity ELSE 0 END),0) ins,COALESCE(SUM(CASE WHEN quantity<0 THEN quantity ELSE 0 END),0) outs FROM stock_movements WHERE item_id=? AND substr(movement_date,1,7)=?",(r.id,mk)).iloc[0]
+        waste=q("SELECT COALESCE(SUM(quantity),0) q FROM wastage WHERE item_id=? AND substr(waste_date,1,7)=?",(r.id,mk)).iloc[0,0]
+        # Physical closing is entered by user; system also displays theoretical stock.
+        theoretical=float(prev)+float(pur.q)+float(moves.ins)+float(moves.outs)-float(waste)
+        old=q("SELECT closing_qty,unit_cost FROM month_closing WHERE item_id=? AND month_key=?",(r.id,mk))
+        oq=float(old.iloc[0,0]) if not old.empty else max(0,theoretical)
+        oc=float(old.iloc[0,1]) if not old.empty else (float(pur.v)/float(pur.q) if pur.q else float(r.opening_unit_cost))
+        rows.append((r.id,f"{r.category} • {r.item_name} • {r.sub_category}",float(prev),theoretical,oq,oc))
+    st.caption("Theoretical quantity = previous closing + purchases + stock-in movements − stock-out movements − wastage. Verify against the physical count.")
+    with st.form("closing"):
+        values=[]
+        for iid,label,opening,theory,qty,cost in rows:
+            a,b,c,d=st.columns([4,1.5,1.5,1.5])
+            with a: st.markdown(f"**{label}**"); st.caption(f"Opening: {opening:g} | Theoretical: {theory:g}")
+            with b: cq=st.number_input("Physical Qty",min_value=0.0,value=max(0,qty),key=f"cq{iid}")
+            with c: uc=st.number_input("Unit Cost",min_value=0.0,value=max(0,cost),key=f"uc{iid}")
+            with d: st.metric("Value",money(cq*uc))
+            values.append((iid,cq,uc))
+        if st.form_submit_button("🔒 Finalize Month-End Closing",type="primary"):
+            c=conn()
+            for iid,cq,uc in values:
+                c.execute("""INSERT INTO month_closing(month_key,item_id,closing_qty,unit_cost,stock_value,closed_at)
+                             VALUES(?,?,?,?,?,?) ON CONFLICT(month_key,item_id) DO UPDATE SET
+                             closing_qty=excluded.closing_qty,unit_cost=excluded.unit_cost,
+                             stock_value=excluded.stock_value,closed_at=excluded.closed_at""",
+                          (mk,iid,cq,uc,cq*uc,datetime.now().isoformat()))
+            c.commit(); c.close(); st.success(f"Month {mk} closed/updated successfully.")
+
+# INVENTORY
+elif page=="Inventory":
+    st.markdown("<div class='pos-title'>Live Inventory</div><div class='pos-sub'>Opening, purchases, stock movements, wastage and closing position by item.</div>",unsafe_allow_html=True)
+    m=st.date_input("Month",month_default,key="invmonth").strftime("%Y-%m")
+    df=q("""SELECT i.id,c.name Category,i.item_name Item,i.sub_category "Sub-category",i.unit Unit,
+            i.reorder_level "Reorder Level",
+            COALESCE((SELECT closing_qty FROM month_closing mc WHERE mc.item_id=i.id AND mc.month_key<? ORDER BY mc.month_key DESC LIMIT 1),i.opening_qty) Opening,
+            COALESCE((SELECT SUM(quantity) FROM purchases p WHERE p.item_id=i.id AND substr(p.purchase_date,1,7)=?),0) Purchases,
+            COALESCE((SELECT SUM(quantity) FROM stock_movements sm WHERE sm.item_id=i.id AND substr(sm.movement_date,1,7)=? AND sm.quantity>0),0) "Other In",
+            COALESCE((SELECT SUM(quantity) FROM stock_movements sm WHERE sm.item_id=i.id AND substr(sm.movement_date,1,7)=? AND sm.quantity<0),0) "Other Out",
+            COALESCE((SELECT SUM(quantity) FROM wastage w WHERE w.item_id=i.id AND substr(w.waste_date,1,7)=?),0) Wastage,
+            COALESCE((SELECT closing_qty FROM month_closing mc WHERE mc.item_id=i.id AND mc.month_key=?),0) Closing
+            FROM items i LEFT JOIN categories c ON c.id=i.category_id WHERE i.active=1
+            ORDER BY c.name,i.item_name,i.sub_category""",(m,m,m,m,m,m))
+    df["Available Before Closing"]=df.Opening+df.Purchases+df["Other In"]+df["Other Out"]-df.Wastage
+    df["Status"]=df.apply(lambda r:"REORDER" if r.Closing<=r["Reorder Level"] else "OK",axis=1)
+    st.dataframe(df.drop(columns=["id"]),use_container_width=True,hide_index=True)
+
+# MOVEMENTS
+elif page=="Stock Movements":
+    st.markdown("<div class='pos-title'>Stock Movement History</div><div class='pos-sub'>Complete audit trail of inventory transactions.</div>",unsafe_allow_html=True)
+    df=q("""SELECT sm.movement_date Date,i.item_name Item,i.sub_category "Sub-category",i.unit Unit,
+            sm.movement_type Type,sm.quantity Quantity,sm.unit_cost "Unit Cost",
+            sm.quantity*sm.unit_cost Value,sm.reference Reference,sm.notes Notes
+            FROM stock_movements sm JOIN items i ON i.id=sm.item_id ORDER BY sm.id DESC""")
+    st.dataframe(df,use_container_width=True,hide_index=True)
+
+# REPORTS
+elif page=="Reports":
+    st.markdown("<div class='pos-title'>Management Reports</div><div class='pos-sub'>Excel-ready monthly reporting pack.</div>",unsafe_allow_html=True)
+    m=st.date_input("Report Month",month_default,key="rmonth").strftime("%Y-%m")
+    sheets={
+      "Purchases":q("""SELECT p.purchase_date Date,s.name Supplier,i.item_name Item,i.sub_category "Sub-category",
+                       p.quantity Quantity,p.unit_price "Unit Price",p.quantity*p.unit_price Total,p.invoice_no "Invoice No."
+                       FROM purchases p JOIN items i ON i.id=p.item_id LEFT JOIN suppliers s ON s.id=p.supplier_id
+                       WHERE substr(p.purchase_date,1,7)=?""",(m,)),
+      "Wastage":q("""SELECT w.waste_date Date,i.item_name Item,i.sub_category "Sub-category",w.quantity Quantity,
+                     w.reason Reason,w.unit_cost "Unit Cost",w.quantity*w.unit_cost "Loss Value"
+                     FROM wastage w JOIN items i ON i.id=w.item_id WHERE substr(w.waste_date,1,7)=?""",(m,)),
+      "Closing Stock":q("""SELECT i.item_name Item,i.sub_category "Sub-category",i.unit Unit,
+                           mc.closing_qty "Closing Qty",mc.unit_cost "Unit Cost",mc.stock_value "Stock Value"
+                           FROM month_closing mc JOIN items i ON i.id=mc.item_id WHERE mc.month_key=?""",(m,)),
+      "Movements":q("""SELECT sm.movement_date Date,i.item_name Item,i.sub_category "Sub-category",
+                       sm.movement_type Type,sm.quantity Quantity,sm.unit_cost "Unit Cost",sm.reference Reference
+                       FROM stock_movements sm JOIN items i ON i.id=sm.item_id
+                       WHERE substr(sm.movement_date,1,7)=?""",(m,))
+    }
+    for name,df in sheets.items():
+        st.markdown(f"### {name}")
+        st.dataframe(df,use_container_width=True,hide_index=True)
+    output=io.BytesIO()
+    with pd.ExcelWriter(output,engine="openpyxl") as writer:
+        for name,df in sheets.items(): df.to_excel(writer,sheet_name=name[:31],index=False)
+    st.download_button("⬇️ Download Complete Excel Report",output.getvalue(),f"restaurant_inventory_{m}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",type="primary")
+
+st.sidebar.divider()
+st.sidebar.caption("Restaurant Inventory POS • SQLite")
