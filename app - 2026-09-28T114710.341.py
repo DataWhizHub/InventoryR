@@ -269,19 +269,6 @@ def init_db():
     );
     """)
 
-    if not cur.execute("SELECT id FROM users LIMIT 1").fetchone():
-        cur.execute("""
-            INSERT INTO users(username,password,full_name,role,active,created_at)
-            VALUES(?,?,?,?,?,?)
-        """, (
-            "admin",
-            hash_password("admin123"),
-            "System Administrator",
-            "Admin",
-            1,
-            datetime.now().isoformat()
-        ))
-
     c.commit()
     c.close()
 
@@ -330,7 +317,62 @@ def get_suppliers():
     """)
 
 
-# ------------------------- LOGIN ----------------------------
+# ------------------------- AUTHENTICATION -------------------
+def registration_exists():
+    return int(query_df("SELECT COUNT(*) AS n FROM users").iloc[0]["n"]) > 0
+
+
+def registration_page():
+    st.markdown("""
+    <div class="login-wrap">
+      <div class="login-card">
+        <div class="login-logo">🍽️ Restaurant Inventory</div>
+        <div class="login-caption">Create the first administrator account</div>
+    """, unsafe_allow_html=True)
+
+    st.info(
+        "This registration is available only once. "
+        "The first registered account becomes the Administrator. "
+        "After registration, this section is permanently replaced by the Login screen."
+    )
+
+    full_name = st.text_input("Full Name *")
+    username = st.text_input("Username *")
+    password = st.text_input("Password *", type="password")
+    confirm = st.text_input("Confirm Password *", type="password")
+
+    if st.button("Create Administrator Account", type="primary", use_container_width=True):
+        if not full_name.strip() or not username.strip() or not password:
+            st.error("Please complete all required fields.")
+        elif len(password) < 6:
+            st.error("Password must contain at least 6 characters.")
+        elif password != confirm:
+            st.error("Passwords do not match.")
+        elif registration_exists():
+            st.warning("Registration has already been completed. Please use Login.")
+            st.rerun()
+        else:
+            try:
+                execute("""
+                    INSERT INTO users
+                    (username,password,full_name,role,active,created_at)
+                    VALUES(?,?,?,?,?,?)
+                """, (
+                    username.strip(),
+                    hash_password(password),
+                    full_name.strip(),
+                    "Admin",
+                    1,
+                    datetime.now().isoformat()
+                ))
+                st.success("Administrator account created successfully. You can now log in.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("That username already exists. Please choose another username.")
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+
 def login_page():
     st.markdown("""
     <div class="login-wrap">
@@ -354,12 +396,15 @@ def login_page():
         else:
             st.error("Invalid username or password.")
 
-    st.caption("First-time login: admin / admin123")
     st.markdown("</div></div>", unsafe_allow_html=True)
 
 
+# First launch: show registration exactly once.
 if "user" not in st.session_state:
-    login_page()
+    if not registration_exists():
+        registration_page()
+    else:
+        login_page()
     st.stop()
 
 
@@ -924,6 +969,10 @@ elif page == "Suppliers":
 # SETTINGS
 # ============================================================
 elif page == "Settings":
+    if not user_can(["Admin"]):
+        st.error("Only an Admin can access Settings and manage users.")
+        st.stop()
+
     st.markdown('<div class="page-title">Settings</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="page-subtitle">Administration, users and system controls.</div>',
@@ -935,6 +984,7 @@ elif page == "Settings":
     # USER MANAGEMENT
     with tab1:
         st.markdown("### User Management")
+        st.caption("The first account is created through one-time registration and becomes Admin. After that, only an Admin can create additional users here.")
 
         with st.form("create_user"):
             a,b,c = st.columns(3)
@@ -944,7 +994,7 @@ elif page == "Settings":
                 full_name = st.text_input("Full Name *")
 
             with b:
-                password = st.text_input("Temporary Password *", type="password")
+                password = st.text_input("Password *", type="password")
                 role = st.selectbox("Role", ["Admin","Manager","Storekeeper","Purchasing","Staff"])
 
             with c:
@@ -953,6 +1003,8 @@ elif page == "Settings":
             if st.form_submit_button("Create User", type="primary"):
                 if not username.strip() or not full_name.strip() or not password:
                     st.error("Username, name and password are required.")
+                elif len(password) < 6:
+                    st.error("Password must contain at least 6 characters.")
                 else:
                     try:
                         execute("""
@@ -1036,6 +1088,15 @@ elif page == "Settings":
         st.code(
             "Estimated Sold = Opening Stock + Monthly Purchases - Wastage - Closing Stock"
         )
+
+        st.markdown("**User access model**")
+        st.markdown("""
+        - The **first account is created once through the Registration section** and automatically becomes **Admin**.
+        - After registration, the Registration section is no longer shown.
+        - **Admin:** full system access, including Settings and user creation.
+        - **User / Staff:** normal inventory, purchasing and reporting access; cannot manage users.
+        - Additional users are created by the Admin from **Settings → Users**.
+        """)
 
         st.markdown("**Recommended monthly workflow**")
         st.markdown("""
