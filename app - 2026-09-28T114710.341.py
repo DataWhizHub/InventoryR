@@ -1,15 +1,24 @@
-
 import streamlit as st
-import sqlite3
 import pandas as pd
+import altair as alt
+import gspread
 import hashlib
+import hmac
+import secrets
+import calendar
 import io
 from datetime import date, datetime
+from google.oauth2.service_account import Credentials
+from gspread.utils import rowcol_to_a1
 
 # ============================================================
-# RESTAURANT INVENTORY & MONTHLY SALES ESTIMATION SYSTEM
-# Formula:
-#   Quantity Sold = Opening Stock + Monthly Purchases - Closing Stock
+# RESTAURANT INVENTORY & SALES PERFORMANCE SYSTEM
+# Storage: Google Sheets only (no local database / CSV)
+#
+#   Stock Entry       : month-end stock (item, size, qty, unit price, description)
+#   Purchases         : purchases of the month (from previous month's stock items)
+#   Sales Performance : Sold = Previous month stock + Purchases - This month stock
+#   Settings          : admin creates / manages user logins
 # ============================================================
 
 st.set_page_config(
@@ -19,264 +28,189 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB = "restaurant_inventory.db"
+MAX_STANDARD_USERS = 3  # 1 Admin + up to 3 normal users
+CACHE_SECONDS = 20      # how long sheet data is cached (protects the Google API quota)
 
 # ------------------------- THEME ----------------------------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+html, body, [class*="css"] { font-family: Inter, sans-serif; }
+.stApp { background: #f3f6fa; }
+.block-container { padding-top: 2.4rem !important; padding-bottom: 2rem; max-width: 1500px; }
 
-html, body, [class*="css"] {
-    font-family: Inter, sans-serif;
-}
-
-.stApp {
-    background: #f3f6fa;
-}
-
-.block-container {
-    padding-top: 2.4rem !important;
-    padding-bottom: 2rem;
-    max-width: 1500px;
-}
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background: #172033 !important;
-    border-right: 1px solid #26344d;
-}
-section[data-testid="stSidebar"] * {
-    color: #eef4ff !important;
-}
-section[data-testid="stSidebar"] .stRadio label {
-    border-radius: 8px;
-    padding: 4px 8px;
-}
-.sidebar-brand {
-    font-size: 1.35rem;
-    font-weight: 800;
-    color: #ffffff !important;
-    margin: 0 0 2px 0;
-}
-.sidebar-sub {
-    color: #9fb0ca !important;
-    font-size: .76rem;
-    margin-bottom: 1rem;
-}
-.user-chip {
-    background: #202d43;
-    border: 1px solid #30415d;
-    border-radius: 10px;
-    padding: 10px 12px;
-    margin: 8px 0 15px 0;
-}
-.user-name {
-    font-weight: 700;
-    color: #fff !important;
-}
-.user-role {
-    font-size: .72rem;
-    color: #9fb0ca !important;
-}
-
-/* Make sidebar logout clearly visible */
+section[data-testid="stSidebar"] { background: #172033 !important; border-right: 1px solid #26344d; }
+section[data-testid="stSidebar"] * { color: #eef4ff !important; }
 section[data-testid="stSidebar"] button {
-    color: #ffffff !important;
-    background: #263754 !important;
-    border: 1px solid #3b4d6b !important;
+    color: #ffffff !important; background: #263754 !important; border: 1px solid #3b4d6b !important;
 }
-section[data-testid="stSidebar"] button:hover {
-    background: #334766 !important;
-    color: #ffffff !important;
-}
+section[data-testid="stSidebar"] button:hover { background: #334766 !important; }
+.sidebar-brand { font-size: 1.35rem; font-weight: 800; color: #ffffff !important; margin: 0 0 2px 0; }
+.sidebar-sub { color: #9fb0ca !important; font-size: .76rem; margin-bottom: 1rem; }
+.user-chip { background: #202d43; border: 1px solid #30415d; border-radius: 10px; padding: 10px 12px; margin: 8px 0 15px 0; }
+.user-name { font-weight: 700; color: #fff !important; }
+.user-role { font-size: .72rem; color: #9fb0ca !important; }
 
-/* Page */
-.page-title {
-    font-size: 2rem;
-    line-height: 1.2;
-    font-weight: 800;
-    color: #162033;
-    margin: 0 0 4px 0;
-}
-.page-subtitle {
-    color: #68758a;
-    margin: 0 0 20px 0;
-    font-size: .92rem;
-}
-
-.card {
-    background: #ffffff;
-    border: 1px solid #e1e7ef;
-    border-radius: 14px;
-    padding: 18px;
-    box-shadow: 0 4px 18px rgba(24, 39, 75, .05);
-}
-.kpi-label {
-    color: #718096;
-    font-size: .76rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: .03em;
-}
-.kpi-value {
-    color: #172033;
-    font-size: 1.55rem;
-    font-weight: 800;
-    margin-top: 5px;
-}
+.page-title { font-size: 2rem; line-height: 1.2; font-weight: 800; color: #162033; margin: 0 0 4px 0; }
+.page-subtitle { color: #68758a; margin: 0 0 20px 0; font-size: .92rem; }
+.card { background: #fff; border: 1px solid #e1e7ef; border-radius: 14px; padding: 18px;
+        box-shadow: 0 4px 18px rgba(24,39,75,.05); }
+.kpi-label { color: #718096; font-size: .76rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+.kpi-value { color: #172033; font-size: 1.55rem; font-weight: 800; margin-top: 5px; }
 .kpi-blue { border-left: 4px solid #2563eb; }
 .kpi-green { border-left: 4px solid #16a34a; }
 .kpi-orange { border-left: 4px solid #ea580c; }
-.kpi-purple { border-left: 4px solid #7c3aed; }
+.section-title { color: #172033; font-weight: 800; font-size: 1.08rem; margin: 22px 0 10px 0; }
+.login-logo { font-size: 2rem; font-weight: 800; color: #172033; }
+.login-caption { color: #718096; margin-bottom: 14px; }
 
-.section-title {
-    color: #172033;
-    font-weight: 800;
-    font-size: 1.08rem;
-    margin: 22px 0 10px 0;
-}
-
-/* Inputs */
-div[data-baseweb="input"] > div,
-div[data-baseweb="select"] > div,
-textarea {
-    border-radius: 8px !important;
-}
-
-/* Login */
-.login-wrap {
-    max-width: 440px;
-    margin: 7vh auto 0 auto;
-}
-.login-card {
-    background: #fff;
-    border: 1px solid #e0e6ef;
-    border-radius: 18px;
-    padding: 30px;
-    box-shadow: 0 12px 35px rgba(24,39,75,.10);
-}
-.login-logo {
-    font-size: 2rem;
-    font-weight: 800;
-    color: #172033;
-}
-.login-caption {
-    color: #718096;
-    margin-bottom: 20px;
-}
-
-/* Tables */
-[data-testid="stDataFrame"] {
-    border-radius: 10px;
-    overflow: hidden;
-}
-
-/* Hide Streamlit menu/footer */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
+div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea { border-radius: 8px !important; }
+[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ------------------------- DATABASE -------------------------
-def get_conn():
-    c = sqlite3.connect(DB, check_same_thread=False)
-    c.execute("PRAGMA foreign_keys = ON")
-    return c
+# ------------------------- GOOGLE SHEETS --------------------
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+TABLES = {
+    "Users": ["id", "username", "password", "full_name", "role", "active", "created_at"],
+    "Items": ["id", "item_name", "size", "active"],
+    "Stock": ["id", "month_key", "item_id", "quantity", "unit_price",
+              "description", "entered_by", "updated_at"],
+    "Purchases": ["id", "month_key", "purchase_date", "item_id", "quantity", "unit_price",
+                  "description", "entered_by", "created_at"],
+}
+NUMERIC_COLS = ["quantity", "unit_price"]
 
 
-def hash_password(password):
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+@st.cache_resource(show_spinner="Connecting to Google Sheets...")
+def get_worksheets():
+    """Connect once, create any missing worksheet tabs and their header rows."""
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SCOPES
+    )
+    sh = gspread.authorize(creds).open_by_key(st.secrets["sheet_id"])
+    existing = {ws.title: ws for ws in sh.worksheets()}
+
+    result = {}
+    for name, headers in TABLES.items():
+        ws = existing.get(name)
+        if ws is None:
+            ws = sh.add_worksheet(title=name, rows=1000, cols=len(headers))
+        if not ws.row_values(1):
+            ws.append_row(headers, value_input_option="RAW")
+        result[name] = ws
+    return result
 
 
-def query_df(sql, params=()):
-    c = get_conn()
-    df = pd.read_sql_query(sql, c, params=params)
-    c.close()
+def _clean(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return int(v)
+    if hasattr(v, "item"):  # numpy scalar
+        v = v.item()
+    return v
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def read_table(name):
+    ws = get_worksheets()[name]
+    values = ws.get_all_values()
+    headers = TABLES[name]
+    rows = []
+    for r in values[1:]:
+        r = (r + [""] * len(headers))[:len(headers)]
+        if r[0] != "":
+            rows.append(r)
+    df = pd.DataFrame(rows, columns=headers)
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    if "active" in df.columns:
+        df["active"] = pd.to_numeric(df["active"], errors="coerce").fillna(0).astype(int)
     return df
 
 
-def execute(sql, params=()):
-    c = get_conn()
-    c.execute(sql, params)
-    c.commit()
-    c.close()
+def new_id(prefix):
+    return f"{prefix}-{secrets.token_hex(4)}"
 
 
-def init_db():
-    c = get_conn()
-    cur = c.cursor()
-
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        full_name TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'Staff',
-        active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS suppliers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        contact TEXT,
-        phone TEXT,
-        email TEXT,
-        address TEXT,
-        active INTEGER DEFAULT 1
-    );
-
-    CREATE TABLE IF NOT EXISTS items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        category TEXT NOT NULL,
-        item_name TEXT NOT NULL,
-        sub_category TEXT NOT NULL,
-        unit TEXT NOT NULL,
-        reorder_level REAL DEFAULT 0,
-        active INTEGER DEFAULT 1,
-        UNIQUE(category, item_name, sub_category)
-    );
-
-    CREATE TABLE IF NOT EXISTS monthly_inventory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        month_key TEXT NOT NULL,
-        item_id INTEGER NOT NULL,
-        opening_qty REAL NOT NULL DEFAULT 0,
-        purchase_qty REAL NOT NULL DEFAULT 0,
-        purchase_unit_price REAL NOT NULL DEFAULT 0,
-        closing_qty REAL NOT NULL DEFAULT 0,
-        wastage_qty REAL NOT NULL DEFAULT 0,
-        notes TEXT,
-        updated_at TEXT NOT NULL,
-        UNIQUE(month_key, item_id),
-        FOREIGN KEY(item_id) REFERENCES items(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS purchase_details (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        month_key TEXT NOT NULL,
-        purchase_date TEXT,
-        supplier_id INTEGER,
-        item_id INTEGER NOT NULL,
-        quantity REAL NOT NULL,
-        unit_price REAL NOT NULL,
-        invoice_no TEXT,
-        notes TEXT,
-        FOREIGN KEY(supplier_id) REFERENCES suppliers(id),
-        FOREIGN KEY(item_id) REFERENCES items(id)
-    );
-    """)
-
-    c.commit()
-    c.close()
+def add_row(name, data):
+    ws = get_worksheets()[name]
+    row = [_clean(data.get(h, "")) for h in TABLES[name]]
+    ws.append_row(row, value_input_option="RAW")
+    read_table.clear()
 
 
-init_db()
+def update_row(name, row_id, changes):
+    ws = get_worksheets()[name]
+    ids = ws.col_values(1)
+    if row_id not in ids:
+        return False
+    r = ids.index(row_id) + 1
+    headers = TABLES[name]
+    batch = [
+        {"range": rowcol_to_a1(r, headers.index(k) + 1), "values": [[_clean(v)]]}
+        for k, v in changes.items()
+    ]
+    ws.batch_update(batch, value_input_option="RAW")
+    read_table.clear()
+    return True
+
+
+def delete_row(name, row_id):
+    ws = get_worksheets()[name]
+    ids = ws.col_values(1)
+    if row_id in ids:
+        ws.delete_rows(ids.index(row_id) + 1)
+    read_table.clear()
+
+
+def find_stock_id(month_key, item_id):
+    """Fresh (uncached) lookup so two people saving at once do not create duplicates."""
+    ws = get_worksheets()["Stock"]
+    for r in ws.get_all_values()[1:]:
+        if len(r) >= 3 and r[1] == month_key and r[2] == item_id:
+            return r[0]
+    return None
+
+
+# Connect now and show a friendly message if setup is incomplete
+try:
+    get_worksheets()
+except KeyError as e:
+    st.error(f"Missing Streamlit secret: {e}. Add `sheet_id` and `[gcp_service_account]` "
+             "to .streamlit/secrets.toml (see the setup notes).")
+    st.stop()
+except gspread.exceptions.SpreadsheetNotFound:
+    st.error("Spreadsheet not found. Check `sheet_id` and share the sheet with the service-account "
+             "email as Editor.")
+    st.stop()
+except Exception as e:
+    st.error(f"Could not connect to Google Sheets: {e}")
+    st.stop()
 
 
 # ------------------------- HELPERS --------------------------
+def hash_password(password):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000).hex()
+    return f"{salt}${digest}"
+
+
+def verify_password(password, stored):
+    try:
+        salt, digest = str(stored).split("$", 1)
+    except ValueError:
+        return False
+    calc = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000).hex()
+    return hmac.compare_digest(calc, digest)
+
+
 def money(value):
     return f"Rs. {float(value):,.2f}"
 
@@ -290,116 +224,124 @@ def previous_month(month_key):
     return d.strftime("%Y-%m")
 
 
-def next_month(month_key):
-    d = pd.to_datetime(month_key + "-01") + pd.DateOffset(months=1)
-    return d.strftime("%Y-%m")
-
-
-def user_can(roles):
-    return st.session_state.user["role"] in roles
+def month_picker(label, key):
+    """Year + month selectors. Returns 'YYYY-MM'."""
+    today = date.today()
+    years = list(range(today.year - 4, today.year + 2))
+    c1, c2, _ = st.columns([1, 1, 2])
+    with c1:
+        y = st.selectbox(f"{label} - Year", years, index=years.index(today.year), key=f"{key}_y")
+    with c2:
+        m = st.selectbox(
+            f"{label} - Month", list(range(1, 13)), index=today.month - 1,
+            format_func=lambda x: calendar.month_name[x], key=f"{key}_m"
+        )
+    return f"{y}-{m:02d}"
 
 
 def get_items():
-    return query_df("""
-        SELECT id, category, item_name, sub_category, unit, reorder_level
-        FROM items
-        WHERE active=1
-        ORDER BY category, item_name, sub_category
-    """)
+    df = read_table("Items")
+    return df[df["active"] == 1][["id", "item_name", "size"]].sort_values(["item_name", "size"])
 
 
-def get_suppliers():
-    return query_df("""
-        SELECT id, name
-        FROM suppliers
-        WHERE active=1
-        ORDER BY name
-    """)
+def items_lookup():
+    """Items renamed so 'id' becomes 'item_id' (for merging with Stock / Purchases)."""
+    df = read_table("Items")
+    return df.rename(columns={"id": "item_id"})[["item_id", "item_name", "size", "active"]]
+
+
+def pick_item(pool, key):
+    """Two-step selector: Item, then Size / Variety. Returns (item_id, item_name, size)."""
+    names = sorted(pool["item_name"].unique())
+    c1, c2 = st.columns(2)
+    with c1:
+        name = st.selectbox("Item", names, key=f"{key}_name")
+    sizes = pool[pool["item_name"] == name].sort_values("size")
+    lookup = dict(zip(sizes["id"], sizes["size"]))
+    with c2:
+        item_id = st.selectbox(
+            "Size / Variety", list(lookup.keys()),
+            format_func=lambda x: lookup[x], key=f"{key}_size_{name}"
+        )
+    return item_id, name, lookup[item_id]
+
+
+def item_exists(name, size):
+    df = read_table("Items")
+    hit = df[(df["item_name"].str.lower() == name.strip().lower()) &
+             (df["size"].str.lower() == size.strip().lower())]
+    return hit
+
+
+def header(title, subtitle):
+    st.markdown(f'<div class="page-title">{title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="page-subtitle">{subtitle}</div>', unsafe_allow_html=True)
+
+
+def normal_user_count():
+    u = read_table("Users")
+    return int(((u["role"] != "Admin") & (u["active"] == 1)).sum())
 
 
 # ------------------------- AUTHENTICATION -------------------
 def registration_exists():
-    return int(query_df("SELECT COUNT(*) AS n FROM users").iloc[0]["n"]) > 0
+    return len(read_table("Users")) > 0
 
 
 def registration_page():
-    st.markdown("""
-    <div class="login-wrap">
-      <div class="login-card">
-        <div class="login-logo">🍽️ Restaurant Inventory</div>
-        <div class="login-caption">Create the first administrator account</div>
-    """, unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown('<div class="login-logo">🍽️ Restaurant Inventory</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-caption">Create the first administrator account</div>', unsafe_allow_html=True)
+        st.info("This screen appears only once. The first account becomes the Administrator. "
+                "The Administrator creates all other logins from Settings.")
 
-    st.info(
-        "This registration is available only once. "
-        "The first registered account becomes the Administrator. "
-        "After registration, this section is permanently replaced by the Login screen."
-    )
+        full_name = st.text_input("Full Name *")
+        username = st.text_input("Username *")
+        password = st.text_input("Password *", type="password")
+        confirm = st.text_input("Confirm Password *", type="password")
 
-    full_name = st.text_input("Full Name *")
-    username = st.text_input("Username *")
-    password = st.text_input("Password *", type="password")
-    confirm = st.text_input("Confirm Password *", type="password")
-
-    if st.button("Create Administrator Account", type="primary", use_container_width=True):
-        if not full_name.strip() or not username.strip() or not password:
-            st.error("Please complete all required fields.")
-        elif len(password) < 6:
-            st.error("Password must contain at least 6 characters.")
-        elif password != confirm:
-            st.error("Passwords do not match.")
-        elif registration_exists():
-            st.warning("Registration has already been completed. Please use Login.")
-            st.rerun()
-        else:
-            try:
-                execute("""
-                    INSERT INTO users
-                    (username,password,full_name,role,active,created_at)
-                    VALUES(?,?,?,?,?,?)
-                """, (
-                    username.strip(),
-                    hash_password(password),
-                    full_name.strip(),
-                    "Admin",
-                    1,
-                    datetime.now().isoformat()
-                ))
-                st.success("Administrator account created successfully. You can now log in.")
-                st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("That username already exists. Please choose another username.")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
+        if st.button("Create Administrator Account", type="primary", use_container_width=True):
+            if not full_name.strip() or not username.strip() or not password:
+                st.error("Please complete all required fields.")
+            elif len(password) < 6:
+                st.error("Password must contain at least 6 characters.")
+            elif password != confirm:
+                st.error("Passwords do not match.")
+            else:
+                read_table.clear()
+                if registration_exists():
+                    st.warning("Registration is already completed. Please log in.")
+                else:
+                    add_row("Users", {
+                        "id": new_id("U"), "username": username.strip(),
+                        "password": hash_password(password), "full_name": full_name.strip(),
+                        "role": "Admin", "active": 1, "created_at": datetime.now().isoformat(),
+                    })
+                    st.success("Administrator created. Please log in.")
+                    st.rerun()
 
 
 def login_page():
-    st.markdown("""
-    <div class="login-wrap">
-      <div class="login-card">
-        <div class="login-logo">🍽️ Restaurant Inventory</div>
-        <div class="login-caption">Monthly stock, purchases & sales estimation</div>
-    """, unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown('<div class="login-logo">🍽️ Restaurant Inventory</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-caption">Monthly stock, purchases & sales performance</div>',
+                    unsafe_allow_html=True)
 
-    username = st.text_input("Username", placeholder="Enter username")
-    password = st.text_input("Password", type="password", placeholder="Enter password")
+        username = st.text_input("Username", placeholder="Enter username")
+        password = st.text_input("Password", type="password", placeholder="Enter password")
 
-    if st.button("Sign In", type="primary", use_container_width=True):
-        df = query_df("""
-            SELECT * FROM users
-            WHERE username=? AND password=? AND active=1
-        """, (username.strip(), hash_password(password)))
-
-        if not df.empty:
-            st.session_state.user = df.iloc[0].to_dict()
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
+        if st.button("Sign In", type="primary", use_container_width=True):
+            users = read_table("Users")
+            hit = users[(users["username"] == username.strip()) & (users["active"] == 1)]
+            if not hit.empty and verify_password(password, hit.iloc[0]["password"]):
+                st.session_state.user = hit.iloc[0].to_dict()
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
 
 
-# First launch: show registration exactly once.
 if "user" not in st.session_state:
     if not registration_exists():
         registration_page()
@@ -410,10 +352,10 @@ if "user" not in st.session_state:
 
 # ------------------------- SIDEBAR --------------------------
 user = st.session_state.user
+is_admin = user["role"] == "Admin"
 
-st.sidebar.markdown('<div class="sidebar-brand">🍽️ Restaurant POS</div>', unsafe_allow_html=True)
-st.sidebar.markdown('<div class="sidebar-sub">Inventory Management</div>', unsafe_allow_html=True)
-
+st.sidebar.markdown('<div class="sidebar-brand">🍽️ Restaurant</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="sidebar-sub">Inventory & Sales Performance</div>', unsafe_allow_html=True)
 st.sidebar.markdown(f"""
 <div class="user-chip">
     <div class="user-name">{user["full_name"]}</div>
@@ -421,691 +363,473 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-menu = [
-    "Dashboard",
-    "Monthly Stock",
-    "Purchases",
-    "Monthly Sales",
-    "Items",
-    "Suppliers",
-]
-
-if user_can(["Admin"]):
+menu = ["Stock Entry", "Purchases", "Sales Performance"]
+if is_admin:
     menu.append("Settings")
 
 page = st.sidebar.radio("MENU", menu)
-
 st.sidebar.divider()
-
+if st.sidebar.button("🔄 Refresh data", use_container_width=True):
+    read_table.clear()
+    st.rerun()
 if st.sidebar.button("↪  Logout", use_container_width=True):
     st.session_state.pop("user", None)
     st.rerun()
 
-st.sidebar.caption("Restaurant Inventory System")
-
 
 # ============================================================
-# DASHBOARD
+# STOCK ENTRY  (month-end stock)
 # ============================================================
-if page == "Dashboard":
-    st.markdown('<div class="page-title">Dashboard</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="page-subtitle">Monthly stock position and estimated item sales.</div>',
-        unsafe_allow_html=True
-    )
+if page == "Stock Entry":
+    header("Monthly Stock Entry",
+           "Enter the physical stock counted at the END of the month: item, size / variety, "
+           "quantity, unit price and description.")
 
-    selected = st.date_input(
-        "Select month",
-        date.today().replace(day=1),
-        key="dashboard_month"
-    )
-    mk = selected.strftime("%Y-%m")
+    mk = month_picker("Stock month", "stock")
 
-    df = query_df("""
-        SELECT
-            mi.month_key,
-            i.category,
-            i.item_name,
-            i.sub_category,
-            i.unit,
-            mi.opening_qty,
-            mi.purchase_qty,
-            mi.closing_qty,
-            mi.wastage_qty,
-            (mi.opening_qty + mi.purchase_qty - mi.wastage_qty - mi.closing_qty) AS sold_qty,
-            mi.purchase_unit_price,
-            (mi.purchase_qty * mi.purchase_unit_price) AS purchase_value
-        FROM monthly_inventory mi
-        JOIN items i ON i.id=mi.item_id
-        WHERE mi.month_key=?
-        ORDER BY i.category, i.item_name, i.sub_category
-    """, (mk,))
-
-    item_count = len(df)
-    purchase_qty = df["purchase_qty"].sum() if not df.empty else 0
-    sold_qty = df["sold_qty"].sum() if not df.empty else 0
-    closing_qty = df["closing_qty"].sum() if not df.empty else 0
-    purchase_value = df["purchase_value"].sum() if not df.empty else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    cards = [
-        ("Items Recorded", item_count, "kpi-blue"),
-        ("Purchased Quantity", f"{purchase_qty:,.2f}", "kpi-green"),
-        ("Estimated Quantity Sold", f"{sold_qty:,.2f}", "kpi-orange"),
-        ("Closing Quantity", f"{closing_qty:,.2f}", "kpi-purple"),
-    ]
-
-    for col, (label, value, cls) in zip([c1,c2,c3,c4], cards):
-        with col:
-            st.markdown(
-                f'<div class="card {cls}"><div class="kpi-label">{label}</div>'
-                f'<div class="kpi-value">{value}</div></div>',
-                unsafe_allow_html=True
-            )
-
-    st.markdown('<div class="section-title">Monthly Stock Position</div>', unsafe_allow_html=True)
-
-    if df.empty:
-        st.info("No monthly stock has been entered for this month.")
-    else:
-        st.dataframe(
-            df[[
-                "category","item_name","sub_category","unit",
-                "opening_qty","purchase_qty","closing_qty",
-                "wastage_qty","sold_qty"
-            ]].rename(columns={
-                "category":"Category",
-                "item_name":"Item",
-                "sub_category":"Sub-category",
-                "unit":"Unit",
-                "opening_qty":"Opening",
-                "purchase_qty":"Purchases",
-                "closing_qty":"Closing",
-                "wastage_qty":"Wastage",
-                "sold_qty":"Estimated Sold",
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # Trend
-    trend = query_df("""
-        SELECT month_key,
-               SUM(opening_qty + purchase_qty - wastage_qty - closing_qty) sold_qty,
-               SUM(purchase_qty) purchase_qty
-        FROM monthly_inventory
-        GROUP BY month_key
-        ORDER BY month_key
-    """)
-
-    if not trend.empty:
-        st.markdown('<div class="section-title">Monthly Quantity Trend</div>', unsafe_allow_html=True)
-        trend["Month"] = pd.to_datetime(trend["month_key"] + "-01").dt.strftime("%b %Y")
-        st.line_chart(trend.set_index("Month")[["purchase_qty","sold_qty"]].rename(
-            columns={"purchase_qty":"Purchases", "sold_qty":"Estimated Sold"}
-        ))
-
-
-# ============================================================
-# MONTHLY STOCK
-# ============================================================
-elif page == "Monthly Stock":
-    st.markdown('<div class="page-title">Monthly Stock Entry</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="page-subtitle">Enter the physical closing stock at the end of every month. '
-        'Opening stock is automatically taken from the previous month.</div>',
-        unsafe_allow_html=True
-    )
-
-    selected = st.date_input("Stock month", date.today().replace(day=1), key="stock_month")
-    mk = selected.strftime("%Y-%m")
-    prev = previous_month(mk)
+    with st.expander("➕ Add a new item or size / variety"):
+        with st.form("new_item_form", clear_on_submit=True):
+            a, b = st.columns(2)
+            new_name = a.text_input("Item name *", placeholder="Water")
+            new_size = b.text_input("Size / Variety *", placeholder="1L")
+            if st.form_submit_button("Add Item"):
+                if not new_name.strip() or not new_size.strip():
+                    st.error("Item name and size / variety are required.")
+                elif not item_exists(new_name, new_size).empty:
+                    st.error("This item and size already exist (it may be inactive - check Settings → Items).")
+                else:
+                    add_row("Items", {"id": new_id("I"), "item_name": new_name.strip(),
+                                      "size": new_size.strip(), "active": 1})
+                    st.success(f"Added {new_name.strip()} - {new_size.strip()}.")
 
     items = get_items()
 
     if items.empty:
-        st.warning("Please create items first.")
+        st.info("No items yet. Add your first item above.")
     else:
-        st.info(
-            f"Opening quantity for {month_label(mk)} is automatically linked to "
-            f"the closing quantity of {month_label(prev)}."
+        item_id, item_name, size = pick_item(items, "stock")
+
+        stock_all = read_table("Stock")
+        existing = stock_all[(stock_all["month_key"] == mk) & (stock_all["item_id"] == item_id)]
+        q0 = float(existing.iloc[0]["quantity"]) if not existing.empty else 0.0
+        p0 = float(existing.iloc[0]["unit_price"]) if not existing.empty else 0.0
+        d0 = str(existing.iloc[0]["description"]) if not existing.empty else ""
+
+        if not existing.empty:
+            st.caption(f"An entry already exists for {item_name} - {size} in {month_label(mk)}. "
+                       "Saving will update it.")
+
+        with st.form("stock_form"):
+            a, b = st.columns(2)
+            qty = a.number_input("Quantity (closing stock)", min_value=0.0, step=1.0,
+                                 value=q0, key=f"sq_{mk}_{item_id}")
+            price = b.number_input("Unit Price (Rs.)", min_value=0.0, step=0.01, format="%.2f",
+                                   value=p0, key=f"sp_{mk}_{item_id}")
+            desc = st.text_area("Description", value=d0, key=f"sd_{mk}_{item_id}")
+
+            if st.form_submit_button("Save Stock", type="primary"):
+                now = datetime.now().isoformat()
+                row_id = find_stock_id(mk, item_id)
+                if row_id:
+                    update_row("Stock", row_id, {
+                        "quantity": float(qty), "unit_price": float(price),
+                        "description": desc.strip(), "entered_by": user["username"],
+                        "updated_at": now,
+                    })
+                else:
+                    add_row("Stock", {
+                        "id": new_id("S"), "month_key": mk, "item_id": item_id,
+                        "quantity": float(qty), "unit_price": float(price),
+                        "description": desc.strip(), "entered_by": user["username"],
+                        "updated_at": now,
+                    })
+                st.success(f"Stock saved: {item_name} - {size} ({month_label(mk)}).")
+
+    # Entries of the selected month
+    st.markdown(f'<div class="section-title">Stock recorded for {month_label(mk)}</div>',
+                unsafe_allow_html=True)
+
+    stock_all = read_table("Stock")
+    entries = stock_all[stock_all["month_key"] == mk].merge(items_lookup(), on="item_id", how="left")
+    entries["Stock Value"] = entries["quantity"] * entries["unit_price"]
+    entries = entries.sort_values(["item_name", "size"])
+
+    if entries.empty:
+        st.info("No stock entered for this month yet.")
+    else:
+        table = entries[["item_name", "size", "quantity", "unit_price", "Stock Value",
+                         "description", "entered_by"]].rename(columns={
+            "item_name": "Item", "size": "Size / Variety", "quantity": "Quantity",
+            "unit_price": "Unit Price", "description": "Description", "entered_by": "Entered By",
+        })
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.markdown(
+            f'<div class="card kpi-blue"><div class="kpi-label">Total Stock Value</div>'
+            f'<div class="kpi-value">{money(entries["Stock Value"].sum())}</div></div>',
+            unsafe_allow_html=True
         )
 
-        rows = []
-
-        for _, item in items.iterrows():
-            old = query_df("""
-                SELECT opening_qty, purchase_qty, purchase_unit_price,
-                       closing_qty, wastage_qty, notes
-                FROM monthly_inventory
-                WHERE month_key=? AND item_id=?
-            """, (mk, item.id))
-
-            previous = query_df("""
-                SELECT closing_qty
-                FROM monthly_inventory
-                WHERE month_key=? AND item_id=?
-            """, (prev, item.id))
-
-            if not previous.empty:
-                opening = float(previous.iloc[0]["closing_qty"])
-            else:
-                opening = 0.0
-
-            if not old.empty:
-                purchase_qty = float(old.iloc[0]["purchase_qty"])
-                purchase_price = float(old.iloc[0]["purchase_unit_price"])
-                closing = float(old.iloc[0]["closing_qty"])
-                wastage = float(old.iloc[0]["wastage_qty"])
-            else:
-                purchase_qty = 0.0
-                purchase_price = 0.0
-                closing = 0.0
-                wastage = 0.0
-
-            rows.append({
-                "id": int(item.id),
-                "label": f"{item.category} • {item.item_name} • {item.sub_category}",
-                "unit": item.unit,
-                "opening": opening,
-                "purchase_qty": purchase_qty,
-                "purchase_price": purchase_price,
-                "closing": closing,
-                "wastage": wastage,
-            })
-
-        with st.form("monthly_stock_form"):
-            st.markdown("#### Enter monthly quantities")
-
-            values = []
-
-            for r in rows:
-                a,b,c,d,e = st.columns([3.1,1.2,1.2,1.2,1.2])
-
-                with a:
-                    st.markdown(f"**{r['label']}**")
-                    st.caption(f"Unit: {r['unit']}  |  Opening: {r['opening']:,.2f}")
-
-                with b:
-                    purchase_qty = st.number_input(
-                        "Purchases",
-                        min_value=0.0,
-                        value=r["purchase_qty"],
-                        step=1.0,
-                        key=f"purchase_{r['id']}"
-                    )
-
-                with c:
-                    purchase_price = st.number_input(
-                        "Unit Price",
-                        min_value=0.0,
-                        value=r["purchase_price"],
-                        step=0.01,
-                        key=f"price_{r['id']}"
-                    )
-
-                with d:
-                    closing = st.number_input(
-                        "Closing Stock",
-                        min_value=0.0,
-                        value=r["closing"],
-                        step=1.0,
-                        key=f"closing_{r['id']}"
-                    )
-
-                with e:
-                    wastage = st.number_input(
-                        "Wastage",
-                        min_value=0.0,
-                        value=r["wastage"],
-                        step=1.0,
-                        key=f"waste_{r['id']}"
-                    )
-
-                sold = r["opening"] + purchase_qty - wastage - closing
-
-                if sold < 0:
-                    st.warning(
-                        f"{r['label']}: calculated sold quantity is negative. "
-                        "Check the stock entries."
-                    )
-
-                values.append((
-                    r["id"],
-                    r["opening"],
-                    purchase_qty,
-                    purchase_price,
-                    closing,
-                    wastage
-                ))
-
-            notes = st.text_area("Month notes")
-
-            if st.form_submit_button("Save Monthly Stock", type="primary"):
-                c = get_conn()
-
-                for item_id, opening, purchase_qty, price, closing, wastage in values:
-                    c.execute("""
-                        INSERT INTO monthly_inventory
-                        (month_key,item_id,opening_qty,purchase_qty,purchase_unit_price,
-                         closing_qty,wastage_qty,notes,updated_at)
-                        VALUES(?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(month_key,item_id)
-                        DO UPDATE SET
-                            opening_qty=excluded.opening_qty,
-                            purchase_qty=excluded.purchase_qty,
-                            purchase_unit_price=excluded.purchase_unit_price,
-                            closing_qty=excluded.closing_qty,
-                            wastage_qty=excluded.wastage_qty,
-                            notes=excluded.notes,
-                            updated_at=excluded.updated_at
-                    """, (
-                        mk, item_id, opening, purchase_qty, price,
-                        closing, wastage, notes, datetime.now().isoformat()
-                    ))
-
-                c.commit()
-                c.close()
-                st.success(f"{month_label(mk)} stock saved successfully.")
+        with st.expander("🗑️ Delete a stock entry"):
+            labels = {r["id"]: f'{r["item_name"]} - {r["size"]}' for _, r in entries.iterrows()}
+            del_id = st.selectbox("Entry", list(labels.keys()), format_func=lambda x: labels[x], key="del_stock")
+            if st.button("Delete Entry", key="del_stock_btn"):
+                delete_row("Stock", del_id)
+                st.rerun()
 
 
 # ============================================================
 # PURCHASES
 # ============================================================
 elif page == "Purchases":
-    st.markdown('<div class="page-title">Monthly Purchases</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="page-subtitle">Optional detailed purchase records. These are linked to the monthly stock quantities.</div>',
-        unsafe_allow_html=True
-    )
+    header("Monthly Purchases",
+           "Record purchases made this month. Items are selected from the PREVIOUS month's stock list.")
 
-    items = get_items()
-    suppliers = get_suppliers()
+    mk = month_picker("Purchase month", "purch")
+    prev = previous_month(mk)
 
-    if items.empty:
-        st.warning("Create items first.")
+    show_all = st.checkbox("Also show items with no stock entry in the previous month", value=False)
+
+    stock_all = read_table("Stock")
+
+    if show_all:
+        pool = get_items()
     else:
-        with st.form("purchase_detail_form"):
-            a,b = st.columns(2)
+        prev_stock = stock_all[stock_all["month_key"] == prev].merge(items_lookup(), on="item_id", how="left")
+        prev_stock = prev_stock[prev_stock["active"] == 1]
+        pool = prev_stock[["item_id", "item_name", "size"]].rename(columns={"item_id": "id"}) \
+            .sort_values(["item_name", "size"])
 
-            with a:
-                purchase_date = st.date_input("Purchase Date", date.today())
-                supplier_id = st.selectbox(
-                    "Supplier",
-                    [0] + suppliers.id.tolist(),
-                    format_func=lambda x: "No supplier" if x == 0 else suppliers.loc[
-                        suppliers.id == x, "name"
-                    ].iloc[0]
-                )
-                invoice = st.text_input("Invoice No.")
+    if pool.empty:
+        st.warning(f"No stock was entered for {month_label(prev)}. "
+                   "Enter that month's stock first, or tick the option above to show all items.")
+    else:
+        item_id, item_name, size = pick_item(pool, "purch")
 
-            with b:
-                item_id = st.selectbox(
-                    "Item",
-                    items.id.tolist(),
-                    format_func=lambda x: (
-                        lambda r: f"{r.category} • {r.item_name} • {r.sub_category} ({r.unit})"
-                    )(items[items.id == x].iloc[0])
-                )
-                quantity = st.number_input("Quantity", min_value=0.0, step=1.0)
-                unit_price = st.number_input("Unit Price (Rs.)", min_value=0.0, step=0.01)
+        prev_row = stock_all[(stock_all["month_key"] == prev) & (stock_all["item_id"] == item_id)]
+        if not prev_row.empty:
+            st.caption(f"{month_label(prev)} stock: {float(prev_row.iloc[0]['quantity']):,.2f} "
+                       f"@ {money(prev_row.iloc[0]['unit_price'])}")
+        default_price = float(prev_row.iloc[0]["unit_price"]) if not prev_row.empty else 0.0
 
-            notes = st.text_area("Notes")
+        y, m = int(mk[:4]), int(mk[5:7])
+        first_day = date(y, m, 1)
+        last_day = date(y, m, calendar.monthrange(y, m)[1])
+
+        with st.form("purchase_form", clear_on_submit=False):
+            a, b, c = st.columns(3)
+            p_date = a.date_input("Purchase Date", value=first_day,
+                                  min_value=first_day, max_value=last_day, key=f"pd_{mk}")
+            qty = b.number_input("Purchase Quantity", min_value=0.0, step=1.0, key=f"pq_{mk}_{item_id}")
+            price = c.number_input("Unit Price (Rs.)", min_value=0.0, step=0.01, format="%.2f",
+                                   value=default_price, key=f"pp_{mk}_{item_id}")
+            desc = st.text_area("Description", key=f"pdesc_{mk}_{item_id}")
 
             if st.form_submit_button("Save Purchase", type="primary"):
-                execute("""
-                    INSERT INTO purchase_details
-                    (month_key,purchase_date,supplier_id,item_id,quantity,unit_price,invoice_no,notes)
-                    VALUES(?,?,?,?,?,?,?,?)
-                """, (
-                    purchase_date.strftime("%Y-%m"),
-                    purchase_date.isoformat(),
-                    None if supplier_id == 0 else supplier_id,
-                    item_id,
-                    quantity,
-                    unit_price,
-                    invoice,
-                    notes
-                ))
-                st.success("Purchase detail saved.")
+                if qty <= 0:
+                    st.error("Purchase quantity must be greater than zero.")
+                else:
+                    add_row("Purchases", {
+                        "id": new_id("P"), "month_key": mk, "purchase_date": p_date.isoformat(),
+                        "item_id": item_id, "quantity": float(qty), "unit_price": float(price),
+                        "description": desc.strip(), "entered_by": user["username"],
+                        "created_at": datetime.now().isoformat(),
+                    })
+                    st.success(f"Purchase saved: {item_name} - {size}.")
 
-        mk = st.date_input("View month", date.today().replace(day=1), key="purchase_view").strftime("%Y-%m")
+    st.markdown(f'<div class="section-title">Purchases in {month_label(mk)}</div>', unsafe_allow_html=True)
 
-        df = query_df("""
-            SELECT
-                p.purchase_date Date,
-                s.name Supplier,
-                i.item_name Item,
-                i.sub_category "Sub-category",
-                i.unit Unit,
-                p.quantity Quantity,
-                p.unit_price "Unit Price",
-                p.quantity*p.unit_price Total,
-                p.invoice_no "Invoice No."
-            FROM purchase_details p
-            JOIN items i ON i.id=p.item_id
-            LEFT JOIN suppliers s ON s.id=p.supplier_id
-            WHERE p.month_key=?
-            ORDER BY p.purchase_date DESC
-        """, (mk,))
+    purch_all = read_table("Purchases")
+    plist = purch_all[purch_all["month_key"] == mk].merge(items_lookup(), on="item_id", how="left")
+    plist["Total"] = plist["quantity"] * plist["unit_price"]
+    plist = plist.sort_values(["purchase_date", "id"], ascending=False)
 
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-# ============================================================
-# MONTHLY SALES
-# ============================================================
-elif page == "Monthly Sales":
-    st.markdown('<div class="page-title">Monthly Sales / Consumption</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="page-subtitle">Estimated from stock movement: Opening + Purchases − Wastage − Closing.</div>',
-        unsafe_allow_html=True
-    )
-
-    selected = st.date_input("Month", date.today().replace(day=1), key="sales_month")
-    mk = selected.strftime("%Y-%m")
-
-    df = query_df("""
-        SELECT
-            i.category Category,
-            i.item_name Item,
-            i.sub_category "Sub-category",
-            i.unit Unit,
-            mi.opening_qty Opening,
-            mi.purchase_qty Purchases,
-            mi.wastage_qty Wastage,
-            mi.closing_qty Closing,
-            (mi.opening_qty + mi.purchase_qty - mi.wastage_qty - mi.closing_qty) AS "Estimated Sold",
-            mi.purchase_unit_price "Purchase Unit Price",
-            (mi.opening_qty + mi.purchase_qty - mi.wastage_qty - mi.closing_qty)
-                * mi.purchase_unit_price AS "Estimated Value"
-        FROM monthly_inventory mi
-        JOIN items i ON i.id=mi.item_id
-        WHERE mi.month_key=?
-        ORDER BY i.category,i.item_name,i.sub_category
-    """, (mk,))
-
-    if df.empty:
-        st.info("No stock data entered for this month.")
+    if plist.empty:
+        st.info("No purchases recorded for this month.")
     else:
-        total = df["Estimated Sold"].sum()
-
+        table = plist[["purchase_date", "item_name", "size", "quantity", "unit_price", "Total",
+                       "description", "entered_by"]].rename(columns={
+            "purchase_date": "Date", "item_name": "Item", "size": "Size / Variety",
+            "quantity": "Quantity", "unit_price": "Unit Price",
+            "description": "Description", "entered_by": "Entered By",
+        })
+        st.dataframe(table, use_container_width=True, hide_index=True)
         st.markdown(
-            f'<div class="card kpi-orange"><div class="kpi-label">Total Estimated Quantity Sold</div>'
-            f'<div class="kpi-value">{total:,.2f}</div></div>',
+            f'<div class="card kpi-green"><div class="kpi-label">Total Purchases</div>'
+            f'<div class="kpi-value">{money(plist["Total"].sum())}</div></div>',
             unsafe_allow_html=True
         )
 
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        chart = df.groupby("Category", as_index=False)["Estimated Sold"].sum()
-        st.markdown("### Estimated Sales by Category")
-        st.bar_chart(chart.set_index("Category"))
-
-        # Excel
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Monthly Sales", index=False)
-
-        st.download_button(
-            "Download Monthly Sales Excel",
-            output.getvalue(),
-            f"monthly_sales_{mk}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-
-# ============================================================
-# ITEMS
-# ============================================================
-elif page == "Items":
-    st.markdown('<div class="page-title">Item Master</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="page-subtitle">Define categories, products and pack sizes such as Water → 1L / 500ML.</div>',
-        unsafe_allow_html=True
-    )
-
-    with st.form("item_form"):
-        a,b,c = st.columns(3)
-
-        with a:
-            category = st.text_input("Category *", placeholder="Beverages")
-            item_name = st.text_input("Item *", placeholder="Water")
-
-        with b:
-            sub_category = st.text_input("Sub-category / Pack Size *", placeholder="1L")
-            unit = st.selectbox(
-                "Unit",
-                ["Bottle","Can","Packet","Box","Kg","g","L","ml","Piece"]
-            )
-
-        with c:
-            reorder = st.number_input("Reorder Level", min_value=0.0, step=1.0)
-
-        if st.form_submit_button("Add Item", type="primary"):
-            if not category.strip() or not item_name.strip() or not sub_category.strip():
-                st.error("Category, Item and Sub-category are required.")
-            else:
-                try:
-                    execute("""
-                        INSERT INTO items
-                        (category,item_name,sub_category,unit,reorder_level)
-                        VALUES(?,?,?,?,?)
-                    """, (
-                        category.strip(),
-                        item_name.strip(),
-                        sub_category.strip(),
-                        unit,
-                        reorder
-                    ))
-                    st.success("Item added.")
-                except sqlite3.IntegrityError:
-                    st.error("This item and sub-category already exist.")
-
-    st.dataframe(
-        query_df("""
-            SELECT
-                category Category,
-                item_name Item,
-                sub_category "Sub-category",
-                unit Unit,
-                reorder_level "Reorder Level"
-            FROM items
-            WHERE active=1
-            ORDER BY category,item_name,sub_category
-        """),
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# SUPPLIERS
-# ============================================================
-elif page == "Suppliers":
-    st.markdown('<div class="page-title">Suppliers</div>', unsafe_allow_html=True)
-    st.markdown('<div class="page-subtitle">Manage restaurant suppliers.</div>', unsafe_allow_html=True)
-
-    with st.form("supplier_form"):
-        a,b = st.columns(2)
-
-        with a:
-            name = st.text_input("Supplier Name *")
-            contact = st.text_input("Contact Person")
-            phone = st.text_input("Phone")
-
-        with b:
-            email = st.text_input("Email")
-            address = st.text_area("Address")
-
-        if st.form_submit_button("Add Supplier", type="primary"):
-            if not name.strip():
-                st.error("Supplier name is required.")
-            else:
-                try:
-                    execute("""
-                        INSERT INTO suppliers(name,contact,phone,email,address)
-                        VALUES(?,?,?,?,?)
-                    """, (name,contact,phone,email,address))
-                    st.success("Supplier added.")
-                except sqlite3.IntegrityError:
-                    st.error("Supplier already exists.")
-
-    st.dataframe(
-        query_df("""
-            SELECT name Supplier,contact "Contact Person",phone Phone,
-                   email Email,address Address
-            FROM suppliers
-            WHERE active=1
-            ORDER BY name
-        """),
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-elif page == "Settings":
-    if not user_can(["Admin"]):
-        st.error("Only an Admin can access Settings and manage users.")
-        st.stop()
-
-    st.markdown('<div class="page-title">Settings</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="page-subtitle">Administration, users and system controls.</div>',
-        unsafe_allow_html=True
-    )
-
-    tab1, tab2, tab3 = st.tabs(["👥 Users", "🔑 My Password", "⚙️ System"])
-
-    # USER MANAGEMENT
-    with tab1:
-        st.markdown("### User Management")
-        st.caption("The first account is created through one-time registration and becomes Admin. After that, only an Admin can create additional users here.")
-
-        with st.form("create_user"):
-            a,b,c = st.columns(3)
-
-            with a:
-                username = st.text_input("Username *")
-                full_name = st.text_input("Full Name *")
-
-            with b:
-                password = st.text_input("Password *", type="password")
-                role = st.selectbox("Role", ["Admin","Manager","Storekeeper","Purchasing","Staff"])
-
-            with c:
-                active = st.checkbox("Active User", value=True)
-
-            if st.form_submit_button("Create User", type="primary"):
-                if not username.strip() or not full_name.strip() or not password:
-                    st.error("Username, name and password are required.")
-                elif len(password) < 6:
-                    st.error("Password must contain at least 6 characters.")
-                else:
-                    try:
-                        execute("""
-                            INSERT INTO users
-                            (username,password,full_name,role,active,created_at)
-                            VALUES(?,?,?,?,?,?)
-                        """, (
-                            username.strip(),
-                            hash_password(password),
-                            full_name.strip(),
-                            role,
-                            1 if active else 0,
-                            datetime.now().isoformat()
-                        ))
-                        st.success("User created.")
-                    except sqlite3.IntegrityError:
-                        st.error("Username already exists.")
-
-        users = query_df("""
-            SELECT id ID,username Username,full_name "Full Name",
-                   role Role,active Active,created_at "Created At"
-            FROM users
-            ORDER BY username
-        """)
-
-        st.dataframe(users, use_container_width=True, hide_index=True)
-
-        st.markdown("### Deactivate User")
-
-        user_choices = users[users["username"] != user["username"]]
-        if not user_choices.empty:
-            selected_user = st.selectbox(
-                "Select user",
-                user_choices.id.tolist(),
-                format_func=lambda x: user_choices.loc[
-                    user_choices.id == x, "username"
-                ].iloc[0]
-            )
-
-            if st.button("Deactivate Selected User"):
-                execute("UPDATE users SET active=0 WHERE id=?", (selected_user,))
-                st.success("User deactivated.")
+        with st.expander("🗑️ Delete a purchase"):
+            labels = {r["id"]: f'{r["purchase_date"]} • {r["item_name"]} - {r["size"]} • {r["quantity"]:g}'
+                      for _, r in plist.iterrows()}
+            del_id = st.selectbox("Purchase", list(labels.keys()), format_func=lambda x: labels[x], key="del_purch")
+            if st.button("Delete Purchase", key="del_purch_btn"):
+                delete_row("Purchases", del_id)
                 st.rerun()
 
-    # PASSWORD
-    with tab2:
-        st.markdown("### Change My Password")
 
+# ============================================================
+# SALES PERFORMANCE
+# ============================================================
+elif page == "Sales Performance":
+    header("Sales Performance",
+           "Quantity sold = Previous month stock + This month purchases − This month stock. "
+           "Sales value = Quantity sold × this month's unit price.")
+
+    stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price"]] \
+        .rename(columns={"quantity": "closing_qty"})
+    purch = read_table("Purchases").groupby(["month_key", "item_id"], as_index=False)["quantity"].sum() \
+        .rename(columns={"quantity": "purchase_qty"})
+    items_all = items_lookup()[["item_id", "item_name", "size"]]
+
+    if stock.empty:
+        st.info("No stock has been entered yet.")
+    else:
+        stock["prev_key"] = stock["month_key"].map(previous_month)
+        prev_stock = stock[["month_key", "item_id", "closing_qty"]].rename(
+            columns={"month_key": "prev_key", "closing_qty": "opening_qty"}
+        )
+
+        df = stock.merge(prev_stock, on=["prev_key", "item_id"], how="left")
+        # Only months where the previous month's stock exists can be calculated
+        df = df[df["prev_key"].isin(set(stock["month_key"]))].copy()
+        df["opening_qty"] = df["opening_qty"].fillna(0.0)
+        df = df.merge(purch, on=["month_key", "item_id"], how="left")
+        df["purchase_qty"] = df["purchase_qty"].fillna(0.0)
+        df = df.merge(items_all, on="item_id", how="left")
+
+        df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
+        df["sales_value"] = df["sold_qty"] * df["unit_price"]
+
+        if df.empty:
+            st.info("Sales need at least two consecutive months of stock entries "
+                    "(previous month and this month).")
+        else:
+            # ---- Filters ----
+            f1, f2, f3 = st.columns([1.3, 1.3, 1.4])
+            with f1:
+                names = ["All items"] + sorted(df["item_name"].dropna().unique().tolist())
+                sel_item = st.selectbox("Item", names, key="sales_item")
+            with f2:
+                if sel_item == "All items":
+                    sel_size = st.selectbox("Size / Variety", ["All sizes"], disabled=True, key="sales_size_all")
+                else:
+                    sizes = ["All sizes"] + sorted(df.loc[df["item_name"] == sel_item, "size"].unique().tolist())
+                    sel_size = st.selectbox("Size / Variety", sizes, key=f"sales_size_{sel_item}")
+            with f3:
+                metric = st.radio("Chart shows", ["Total Sales (Rs.)", "Quantity Sold"],
+                                  horizontal=True, key="sales_metric")
+
+            view = df.copy()
+            if sel_item != "All items":
+                view = view[view["item_name"] == sel_item]
+                if sel_size != "All sizes":
+                    view = view[view["size"] == sel_size]
+
+            if view.empty:
+                st.info("No sales data for this selection.")
+            else:
+                col = "sales_value" if metric.startswith("Total") else "sold_qty"
+
+                trend = view.groupby("month_key", as_index=False)[col].sum().sort_values("month_key")
+                trend["Month"] = pd.to_datetime(trend["month_key"] + "-01").dt.strftime("%b %Y")
+                trend = trend.rename(columns={col: "Value"})
+
+                total_sales = view["sales_value"].sum()
+                total_qty = view["sold_qty"].sum()
+                k1, k2, k3 = st.columns(3)
+                for k, (label, value, cls) in zip(
+                    [k1, k2, k3],
+                    [("Total Sales", money(total_sales), "kpi-orange"),
+                     ("Total Quantity Sold", f"{total_qty:,.2f}", "kpi-blue"),
+                     ("Months Covered", str(trend.shape[0]), "kpi-green")]
+                ):
+                    with k:
+                        st.markdown(
+                            f'<div class="card {cls}"><div class="kpi-label">{label}</div>'
+                            f'<div class="kpi-value">{value}</div></div>',
+                            unsafe_allow_html=True
+                        )
+
+                title = "All items" if sel_item == "All items" else (
+                    sel_item if sel_size == "All sizes" else f"{sel_item} - {sel_size}")
+                st.markdown(f'<div class="section-title">Monthly Sales: {title}</div>', unsafe_allow_html=True)
+
+                chart = (
+                    alt.Chart(trend)
+                    .mark_line(point=True, strokeWidth=3, color="#2563eb")
+                    .encode(
+                        x=alt.X("Month:N", sort=trend["Month"].tolist(), title="Month",
+                                axis=alt.Axis(labelAngle=0)),
+                        y=alt.Y("Value:Q", title=metric),
+                        tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Value:Q", title=metric, format=",.2f")],
+                    )
+                    .properties(height=400)
+                )
+                st.altair_chart(chart, use_container_width=True)
+
+                if (view["sold_qty"] < 0).any():
+                    st.warning("Some rows have a negative quantity sold. "
+                               "Check the stock or purchase entries for those items.")
+
+                st.markdown('<div class="section-title">Details</div>', unsafe_allow_html=True)
+                table = view.sort_values(["month_key", "item_name", "size"])[
+                    ["month_key", "item_name", "size", "opening_qty", "purchase_qty",
+                     "closing_qty", "sold_qty", "unit_price", "sales_value"]
+                ].rename(columns={
+                    "month_key": "Month", "item_name": "Item", "size": "Size / Variety",
+                    "opening_qty": "Previous Stock", "purchase_qty": "Purchases",
+                    "closing_qty": "This Month Stock", "sold_qty": "Quantity Sold",
+                    "unit_price": "Unit Price", "sales_value": "Sales Value",
+                })
+                st.dataframe(table, use_container_width=True, hide_index=True)
+
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                    table.to_excel(writer, sheet_name="Sales Performance", index=False)
+                st.download_button(
+                    "Download Excel", out.getvalue(), "sales_performance.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+
+# ============================================================
+# SETTINGS (Admin only)
+# ============================================================
+elif page == "Settings":
+    if not is_admin:
+        st.error("Only an Admin can access Settings.")
+        st.stop()
+
+    header("Settings", "Create user logins, manage items and change your password.")
+
+    tab1, tab2, tab3 = st.tabs(["👥 Users", "📦 Items", "🔑 My Password"])
+
+    # ---------------- USERS ----------------
+    with tab1:
+        used = normal_user_count()
+        st.markdown("### Create New Login")
+        st.caption(f"Active users: {used} of {MAX_STANDARD_USERS} (Admin not counted).")
+
+        if used >= MAX_STANDARD_USERS:
+            st.warning(f"The limit of {MAX_STANDARD_USERS} users is reached. "
+                       "Deactivate a user to create another login.")
+        else:
+            with st.form("create_user", clear_on_submit=True):
+                a, b = st.columns(2)
+                full_name = a.text_input("Full Name *")
+                username = a.text_input("Username *")
+                password = b.text_input("Password *", type="password")
+                confirm = b.text_input("Confirm Password *", type="password")
+
+                if st.form_submit_button("Create User", type="primary"):
+                    users_now = read_table("Users")
+                    if not full_name.strip() or not username.strip() or not password:
+                        st.error("Full name, username and password are required.")
+                    elif len(password) < 6:
+                        st.error("Password must contain at least 6 characters.")
+                    elif password != confirm:
+                        st.error("Passwords do not match.")
+                    elif (users_now["username"].str.lower() == username.strip().lower()).any():
+                        st.error("That username already exists.")
+                    else:
+                        add_row("Users", {
+                            "id": new_id("U"), "username": username.strip(),
+                            "password": hash_password(password), "full_name": full_name.strip(),
+                            "role": "User", "active": 1, "created_at": datetime.now().isoformat(),
+                        })
+                        st.success(f"Login created for {username.strip()}.")
+                        st.rerun()
+
+        users = read_table("Users").sort_values(["role", "username"])
+        users["Status"] = users["active"].map({1: "Active", 0: "Inactive"})
+        st.dataframe(
+            users[["username", "full_name", "role", "Status", "created_at"]].rename(columns={
+                "username": "Username", "full_name": "Full Name", "role": "Role", "created_at": "Created At"}),
+            use_container_width=True, hide_index=True
+        )
+
+        others = users[users["username"] != user["username"]]
+        if not others.empty:
+            st.markdown("### Manage User")
+            labels = {r["id"]: f'{r["username"]} ({r["Status"]})' for _, r in others.iterrows()}
+            sel = st.selectbox("Select user", list(labels.keys()), format_func=lambda x: labels[x], key="manage_user")
+            row = others[others["id"] == sel].iloc[0]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if row["Status"] == "Active":
+                    if st.button("Deactivate User"):
+                        update_row("Users", sel, {"active": 0})
+                        st.rerun()
+                else:
+                    if st.button("Reactivate User"):
+                        if row["role"] != "Admin" and normal_user_count() >= MAX_STANDARD_USERS:
+                            st.error(f"The limit of {MAX_STANDARD_USERS} active users is reached.")
+                        else:
+                            update_row("Users", sel, {"active": 1})
+                            st.rerun()
+            with c2:
+                with st.form("reset_pw", clear_on_submit=True):
+                    new_pw = st.text_input("New password for selected user", type="password")
+                    if st.form_submit_button("Reset Password"):
+                        if len(new_pw) < 6:
+                            st.error("Password must contain at least 6 characters.")
+                        else:
+                            update_row("Users", sel, {"password": hash_password(new_pw)})
+                            st.success("Password reset.")
+
+    # ---------------- ITEMS ----------------
+    with tab2:
+        st.markdown("### Item Master")
+        with st.form("settings_item_form", clear_on_submit=True):
+            a, b = st.columns(2)
+            n = a.text_input("Item name *", placeholder="Water")
+            s = b.text_input("Size / Variety *", placeholder="500ml")
+            if st.form_submit_button("Add Item", type="primary"):
+                if not n.strip() or not s.strip():
+                    st.error("Item name and size / variety are required.")
+                elif not item_exists(n, s).empty:
+                    st.error("This item and size already exist.")
+                else:
+                    add_row("Items", {"id": new_id("I"), "item_name": n.strip(),
+                                      "size": s.strip(), "active": 1})
+                    st.success("Item added.")
+                    st.rerun()
+
+        all_items = read_table("Items").sort_values(["item_name", "size"])
+        all_items["Status"] = all_items["active"].map({1: "Active", 0: "Inactive"})
+        st.dataframe(
+            all_items[["item_name", "size", "Status"]].rename(
+                columns={"item_name": "Item", "size": "Size / Variety"}),
+            use_container_width=True, hide_index=True
+        )
+
+        if not all_items.empty:
+            labels = {r["id"]: f'{r["item_name"]} - {r["size"]} ({r["Status"]})' for _, r in all_items.iterrows()}
+            sel_i = st.selectbox("Select item", list(labels.keys()), format_func=lambda x: labels[x], key="manage_item")
+            is_active = int(all_items[all_items["id"] == sel_i].iloc[0]["active"]) == 1
+            if st.button("Deactivate Item" if is_active else "Reactivate Item"):
+                update_row("Items", sel_i, {"active": 0 if is_active else 1})
+                st.rerun()
+            st.caption("Inactive items are hidden from selection lists; past records and sales history are kept.")
+
+    # ---------------- MY PASSWORD ----------------
+    with tab3:
+        st.markdown("### Change My Password")
         old = st.text_input("Current Password", type="password")
         new = st.text_input("New Password", type="password")
         confirm = st.text_input("Confirm New Password", type="password")
 
         if st.button("Change Password", type="primary"):
-            current = query_df(
-                "SELECT password FROM users WHERE id=?",
-                (user["id"],)
-            )
-
-            if current.empty or current.iloc[0]["password"] != hash_password(old):
+            users_now = read_table("Users")
+            current = users_now[users_now["id"] == user["id"]]
+            if current.empty or not verify_password(old, current.iloc[0]["password"]):
                 st.error("Current password is incorrect.")
             elif len(new) < 6:
                 st.error("New password must contain at least 6 characters.")
             elif new != confirm:
                 st.error("New passwords do not match.")
             else:
-                execute(
-                    "UPDATE users SET password=? WHERE id=?",
-                    (hash_password(new), user["id"])
-                )
+                update_row("Users", user["id"], {"password": hash_password(new)})
                 st.success("Password changed successfully.")
-
-    # SYSTEM
-    with tab3:
-        st.markdown("### System Information")
-        st.info(
-            "Monthly sales are estimates based on stock counts. "
-            "The system does not directly read POS sales transactions."
-        )
-
-        st.markdown("**Inventory formula**")
-        st.code(
-            "Estimated Sold = Opening Stock + Monthly Purchases - Wastage - Closing Stock"
-        )
-
-        st.markdown("**User access model**")
-        st.markdown("""
-        - The **first account is created once through the Registration section** and automatically becomes **Admin**.
-        - After registration, the Registration section is no longer shown.
-        - **Admin:** full system access, including Settings and user creation.
-        - **User / Staff:** normal inventory, purchasing and reporting access; cannot manage users.
-        - Additional users are created by the Admin from **Settings → Users**.
-        """)
-
-        st.markdown("**Recommended monthly workflow**")
-        st.markdown("""
-        1. Enter/confirm the previous month's physical closing stock.
-        2. At the beginning of the month, record purchases.
-        3. At the end of the month, count physical closing stock.
-        4. The system automatically calculates estimated quantity sold.
-        5. Review the Monthly Sales report.
-        """)
-
-        st.markdown("**Database**")
-        st.code(DB)
