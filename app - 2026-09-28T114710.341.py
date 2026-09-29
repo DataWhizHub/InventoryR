@@ -85,6 +85,10 @@ TABLES = {
 }
 NUMERIC_COLS = ["quantity", "unit_price"]
 
+# Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases so they never
+# clash with tabs from your other apps if you reuse the same Google Sheet file.
+TAB_PREFIX = "Rest_"
+
 
 @st.cache_resource(show_spinner="Connecting to Google Sheets...")
 def get_worksheets():
@@ -93,15 +97,23 @@ def get_worksheets():
         dict(st.secrets["gcp_service_account"]), scopes=SCOPES
     )
     sh = gspread.authorize(creds).open_by_key(st.secrets["sheet_id"])
-    existing = {ws.title: ws for ws in sh.worksheets()}
+    # Google Sheets tab names are case-insensitive, so match that way
+    existing = {ws.title.strip().lower(): ws for ws in sh.worksheets()}
 
     result = {}
     for name, headers in TABLES.items():
-        ws = existing.get(name)
+        title = TAB_PREFIX + name
+        ws = existing.get(title.lower())
         if ws is None:
-            ws = sh.add_worksheet(title=name, rows=1000, cols=len(headers))
-        if not ws.row_values(1):
+            ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
+        first_row = ws.row_values(1)
+        if not first_row:
             ws.append_row(headers, value_input_option="RAW")
+        elif [h.strip() for h in first_row[:len(headers)]] != headers:
+            raise ValueError(
+                f"The tab '{ws.title}' already exists but its header row does not match this app "
+                f"(expected: {', '.join(headers)}). Rename or delete that tab, or change TAB_PREFIX."
+            )
         result[name] = ws
     return result
 
