@@ -488,10 +488,26 @@ if st.sidebar.button("↪  Logout", use_container_width=True):
 # ============================================================
 if page == "Stock Entry":
     header("Monthly Stock Entry",
-           "Enter the physical stock counted at the END of the month: item, size / variety, "
-           "quantity, unit price and description.")
+           "Order of work: Opening stock (first month only) → Purchases → Closing stock at the end of "
+           "each month. Later months use the previous month's closing stock as their opening stock.")
 
     mk = month_picker("Stock month", "stock")
+
+    stock_type = st.radio(
+        "Stock type",
+        ["Closing stock (end of month)", "Opening stock (start of month)"],
+        horizontal=True, key="stock_type",
+    )
+    is_opening = stock_type.startswith("Opening")
+    # Opening stock of a month = closing stock of the previous month, so it is stored under that month.
+    sk = previous_month(mk) if is_opening else mk
+    if is_opening:
+        stock_title = f"Opening stock - start of {month_label(mk)}"
+        st.info(f"Opening stock of {month_label(mk)} is the same as the closing stock of {month_label(sk)}. "
+                "Enter it once for your first month; after that it comes automatically from the previous "
+                "month's closing stock.")
+    else:
+        stock_title = f"Closing stock - end of {month_label(mk)}"
 
     with st.expander("➕ Add a new item with its sizes / varieties"):
         add_item_ui("stock_add")
@@ -501,7 +517,7 @@ if page == "Stock Entry":
     if items.empty:
         st.info("No items yet. Add your first item above.")
     else:
-        prev = previous_month(mk)
+        prev = previous_month(sk)
         stock_all = read_table("Stock")
 
         item_names = ["All items"] + sorted(items["item_name"].unique().tolist())
@@ -510,7 +526,7 @@ if page == "Stock Entry":
         pool = items if sel_item == "All items" else items[items["item_name"] == sel_item]
         pool = pool.rename(columns={"id": "item_id"})
 
-        cur = stock_all[stock_all["month_key"] == mk][["item_id", "quantity", "unit_price", "description"]]
+        cur = stock_all[stock_all["month_key"] == sk][["item_id", "quantity", "unit_price", "description"]]
         prv = stock_all[stock_all["month_key"] == prev][["item_id", "unit_price"]] \
             .rename(columns={"unit_price": "prev_price"})
 
@@ -529,7 +545,7 @@ if page == "Stock Entry":
         })
 
         st.session_state.setdefault("stock_ver", 0)
-        st.caption(f"Fill the table for {month_label(mk)} and press **Save Stock** once - "
+        st.caption(f"{stock_title}: fill the table and press **Save Stock** once - "
                    "all rows are saved together. Leave Quantity empty to skip a row; enter 0 if the item is out of stock.")
 
         with st.form("stock_form"):
@@ -541,11 +557,13 @@ if page == "Stock Entry":
                 disabled=["Item", "Size / Variety"],
                 column_config={
                     "item_id": None,
-                    "Quantity": st.column_config.NumberColumn("Quantity (closing stock)", min_value=0.0, step=1.0),
+                    "Quantity": st.column_config.NumberColumn(
+                        "Quantity (opening stock)" if is_opening else "Quantity (closing stock)",
+                        min_value=0.0, step=1.0),
                     "Unit Price": st.column_config.NumberColumn("Unit Price (Rs.)", min_value=0.0, format="%.2f"),
                     "Description": st.column_config.TextColumn("Description"),
                 },
-                key=f"stock_editor_{mk}_{sel_item}_{st.session_state['stock_ver']}",
+                key=f"stock_editor_{sk}_{sel_item}_{st.session_state['stock_ver']}",
             )
             save_clicked = st.form_submit_button("Save Stock", type="primary")
 
@@ -563,16 +581,16 @@ if page == "Stock Entry":
             if not rows:
                 st.warning("Enter at least one quantity before saving.")
             else:
-                save_stock_batch(mk, rows, user["username"])
+                save_stock_batch(sk, rows, user["username"])
                 st.session_state["stock_ver"] += 1
-                st.success(f"{len(rows)} stock entr{'y' if len(rows) == 1 else 'ies'} saved for {month_label(mk)}.")
+                st.success(f"{len(rows)} stock entr{'y' if len(rows) == 1 else 'ies'} saved: {stock_title}.")
 
     # Entries of the selected month
-    st.markdown(f'<div class="section-title">Stock recorded for {month_label(mk)}</div>',
+    st.markdown(f'<div class="section-title">{stock_title}</div>',
                 unsafe_allow_html=True)
 
     stock_all = read_table("Stock")
-    entries = stock_all[stock_all["month_key"] == mk].merge(items_lookup(), on="item_id", how="left")
+    entries = stock_all[stock_all["month_key"] == sk].merge(items_lookup(), on="item_id", how="left")
     entries["Stock Value"] = entries["quantity"] * entries["unit_price"]
     entries = entries.sort_values(["item_name", "size"])
 
@@ -622,8 +640,9 @@ elif page == "Purchases":
             .sort_values(["item_name", "size"])
 
     if pool.empty:
-        st.warning(f"No stock was entered for {month_label(prev)}. "
-                   "Enter that month's stock first, or tick the option above to show all items.")
+        st.warning(f"No stock was entered for {month_label(prev)}. Enter the opening stock of "
+                   f"{month_label(mk)} (Stock Entry → Opening stock) or the closing stock of {month_label(prev)} first, "
+                   "or tick the option above to show all items.")
     else:
         item_id, item_name, size = pick_item(pool, "purch")
 
