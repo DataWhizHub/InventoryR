@@ -191,6 +191,54 @@ def find_stock_id(month_key, item_id):
     return None
 
 
+def add_rows(name, rows):
+    """Append many rows with ONE API call."""
+    if not rows:
+        return
+    ws = get_worksheets()[name]
+    data = [[_clean(r.get(h, "")) for h in TABLES[name]] for r in rows]
+    ws.append_rows(data, value_input_option="RAW")
+    read_table.clear()
+
+
+def save_stock_batch(month_key, rows, entered_by):
+    """
+    Save many stock entries at once (max 3 API calls, however many rows).
+    rows: list of dicts with item_id, quantity, unit_price, description.
+    Existing (month, item) rows are updated, the rest are appended.
+    """
+    ws = get_worksheets()["Stock"]
+    values = ws.get_all_values()
+    sheet_row = {}  # (month_key, item_id) -> row number in the sheet
+    for i, r in enumerate(values[1:], start=2):
+        if len(r) >= 3 and r[0] != "":
+            sheet_row[(r[1], r[2])] = i
+
+    now = datetime.now().isoformat()
+    updates, new_rows = [], []
+    for r in rows:
+        key = (month_key, r["item_id"])
+        if key in sheet_row:
+            n = sheet_row[key]
+            # columns D..H = quantity, unit_price, description, entered_by, updated_at
+            updates.append({
+                "range": f"D{n}:H{n}",
+                "values": [[float(r["quantity"]), float(r["unit_price"]),
+                            r["description"], entered_by, now]],
+            })
+        else:
+            new_rows.append([
+                new_id("S"), month_key, r["item_id"], float(r["quantity"]),
+                float(r["unit_price"]), r["description"], entered_by, now,
+            ])
+
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW")
+    read_table.clear()
+
+
 # Connect now and show a friendly message if setup is incomplete
 try:
     get_worksheets()
@@ -283,6 +331,52 @@ def item_exists(name, size):
     hit = df[(df["item_name"].str.lower() == name.strip().lower()) &
              (df["size"].str.lower() == size.strip().lower())]
     return hit
+
+
+def add_item_ui(key):
+    """Add an item and all its sizes / varieties in one go, using a table."""
+    ver_key = f"{key}_ver"
+    st.session_state.setdefault(ver_key, 0)
+
+    with st.form(f"{key}_form", clear_on_submit=True):
+        name = st.text_input("Item name *", placeholder="Water")
+        st.caption("List its sizes / varieties below. Click the empty bottom row to add more rows.")
+        sizes_df = st.data_editor(
+            pd.DataFrame({"Size / Variety": ["", "", ""]}),
+            num_rows="dynamic", hide_index=True, use_container_width=True,
+            key=f"{key}_sizes_{st.session_state[ver_key]}",
+        )
+        submitted = st.form_submit_button("Save Item & Sizes", type="primary")
+
+    if submitted:
+        sizes, seen = [], set()
+        for s in sizes_df["Size / Variety"].fillna("").astype(str):
+            s = s.strip()
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                sizes.append(s)
+
+        if not name.strip():
+            st.error("Item name is required.")
+        elif not sizes:
+            st.error("Add at least one size / variety.")
+        else:
+            items_df = read_table("Items")
+            taken = set(
+                items_df.loc[items_df["item_name"].str.lower() == name.strip().lower(), "size"].str.lower()
+            )
+            to_add = [s for s in sizes if s.lower() not in taken]
+            skipped = [s for s in sizes if s.lower() in taken]
+
+            if to_add:
+                add_rows("Items", [
+                    {"id": new_id("I"), "item_name": name.strip(), "size": s, "active": 1}
+                    for s in to_add
+                ])
+                st.session_state[ver_key] += 1
+                st.success(f"Added {name.strip()}: {', '.join(to_add)}.")
+            if skipped:
+                st.warning(f"Already exist (skipped, may be inactive): {', '.join(skipped)}.")
 
 
 def header(title, subtitle):
@@ -399,63 +493,79 @@ if page == "Stock Entry":
 
     mk = month_picker("Stock month", "stock")
 
-    with st.expander("➕ Add a new item or size / variety"):
-        with st.form("new_item_form", clear_on_submit=True):
-            a, b = st.columns(2)
-            new_name = a.text_input("Item name *", placeholder="Water")
-            new_size = b.text_input("Size / Variety *", placeholder="1L")
-            if st.form_submit_button("Add Item"):
-                if not new_name.strip() or not new_size.strip():
-                    st.error("Item name and size / variety are required.")
-                elif not item_exists(new_name, new_size).empty:
-                    st.error("This item and size already exist (it may be inactive - check Settings → Items).")
-                else:
-                    add_row("Items", {"id": new_id("I"), "item_name": new_name.strip(),
-                                      "size": new_size.strip(), "active": 1})
-                    st.success(f"Added {new_name.strip()} - {new_size.strip()}.")
+    with st.expander("➕ Add a new item with its sizes / varieties"):
+        add_item_ui("stock_add")
 
     items = get_items()
 
     if items.empty:
         st.info("No items yet. Add your first item above.")
     else:
-        item_id, item_name, size = pick_item(items, "stock")
-
+        prev = previous_month(mk)
         stock_all = read_table("Stock")
-        existing = stock_all[(stock_all["month_key"] == mk) & (stock_all["item_id"] == item_id)]
-        q0 = float(existing.iloc[0]["quantity"]) if not existing.empty else 0.0
-        p0 = float(existing.iloc[0]["unit_price"]) if not existing.empty else 0.0
-        d0 = str(existing.iloc[0]["description"]) if not existing.empty else ""
 
-        if not existing.empty:
-            st.caption(f"An entry already exists for {item_name} - {size} in {month_label(mk)}. "
-                       "Saving will update it.")
+        item_names = ["All items"] + sorted(items["item_name"].unique().tolist())
+        sel_item = st.selectbox("Item", item_names, key="stock_item_sel")
+
+        pool = items if sel_item == "All items" else items[items["item_name"] == sel_item]
+        pool = pool.rename(columns={"id": "item_id"})
+
+        cur = stock_all[stock_all["month_key"] == mk][["item_id", "quantity", "unit_price", "description"]]
+        prv = stock_all[stock_all["month_key"] == prev][["item_id", "unit_price"]] \
+            .rename(columns={"unit_price": "prev_price"})
+
+        base = pool.merge(cur, on="item_id", how="left").merge(prv, on="item_id", how="left")
+        base["unit_price"] = base["unit_price"].fillna(base["prev_price"])  # suggest last month's price
+        base["description"] = base["description"].fillna("")
+        base = base.sort_values(["item_name", "size"])
+
+        editor_df = pd.DataFrame({
+            "item_id": base["item_id"].values,
+            "Item": base["item_name"].values,
+            "Size / Variety": base["size"].values,
+            "Quantity": base["quantity"].values,
+            "Unit Price": base["unit_price"].values,
+            "Description": base["description"].values,
+        })
+
+        st.session_state.setdefault("stock_ver", 0)
+        st.caption(f"Fill the table for {month_label(mk)} and press **Save Stock** once - "
+                   "all rows are saved together. Leave Quantity empty to skip a row; enter 0 if the item is out of stock.")
 
         with st.form("stock_form"):
-            a, b = st.columns(2)
-            qty = a.number_input("Quantity (closing stock)", min_value=0.0, step=1.0,
-                                 value=q0, key=f"sq_{mk}_{item_id}")
-            price = b.number_input("Unit Price (Rs.)", min_value=0.0, step=0.01, format="%.2f",
-                                   value=p0, key=f"sp_{mk}_{item_id}")
-            desc = st.text_area("Description", value=d0, key=f"sd_{mk}_{item_id}")
+            edited = st.data_editor(
+                editor_df,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                disabled=["Item", "Size / Variety"],
+                column_config={
+                    "item_id": None,
+                    "Quantity": st.column_config.NumberColumn("Quantity (closing stock)", min_value=0.0, step=1.0),
+                    "Unit Price": st.column_config.NumberColumn("Unit Price (Rs.)", min_value=0.0, format="%.2f"),
+                    "Description": st.column_config.TextColumn("Description"),
+                },
+                key=f"stock_editor_{mk}_{sel_item}_{st.session_state['stock_ver']}",
+            )
+            save_clicked = st.form_submit_button("Save Stock", type="primary")
 
-            if st.form_submit_button("Save Stock", type="primary"):
-                now = datetime.now().isoformat()
-                row_id = find_stock_id(mk, item_id)
-                if row_id:
-                    update_row("Stock", row_id, {
-                        "quantity": float(qty), "unit_price": float(price),
-                        "description": desc.strip(), "entered_by": user["username"],
-                        "updated_at": now,
-                    })
-                else:
-                    add_row("Stock", {
-                        "id": new_id("S"), "month_key": mk, "item_id": item_id,
-                        "quantity": float(qty), "unit_price": float(price),
-                        "description": desc.strip(), "entered_by": user["username"],
-                        "updated_at": now,
-                    })
-                st.success(f"Stock saved: {item_name} - {size} ({month_label(mk)}).")
+        if save_clicked:
+            rows = []
+            for _, r in edited.iterrows():
+                if pd.isna(r["Quantity"]):
+                    continue
+                rows.append({
+                    "item_id": r["item_id"],
+                    "quantity": float(r["Quantity"]),
+                    "unit_price": 0.0 if pd.isna(r["Unit Price"]) else float(r["Unit Price"]),
+                    "description": "" if pd.isna(r["Description"]) else str(r["Description"]).strip(),
+                })
+            if not rows:
+                st.warning("Enter at least one quantity before saving.")
+            else:
+                save_stock_batch(mk, rows, user["username"])
+                st.session_state["stock_ver"] += 1
+                st.success(f"{len(rows)} stock entr{'y' if len(rows) == 1 else 'ies'} saved for {month_label(mk)}.")
 
     # Entries of the selected month
     st.markdown(f'<div class="section-title">Stock recorded for {month_label(mk)}</div>',
@@ -794,20 +904,7 @@ elif page == "Settings":
     # ---------------- ITEMS ----------------
     with tab2:
         st.markdown("### Item Master")
-        with st.form("settings_item_form", clear_on_submit=True):
-            a, b = st.columns(2)
-            n = a.text_input("Item name *", placeholder="Water")
-            s = b.text_input("Size / Variety *", placeholder="500ml")
-            if st.form_submit_button("Add Item", type="primary"):
-                if not n.strip() or not s.strip():
-                    st.error("Item name and size / variety are required.")
-                elif not item_exists(n, s).empty:
-                    st.error("This item and size already exist.")
-                else:
-                    add_row("Items", {"id": new_id("I"), "item_name": n.strip(),
-                                      "size": s.strip(), "active": 1})
-                    st.success("Item added.")
-                    st.rerun()
+        add_item_ui("settings_add")
 
         all_items = read_table("Items").sort_values(["item_name", "size"])
         all_items["Status"] = all_items["active"].map({1: "Active", 0: "Inactive"})
