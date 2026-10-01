@@ -890,17 +890,19 @@ elif page == "Sales Performance":
                     sel_item if sel_size == "All sizes" else f"{sel_item} - {size_label(sel_size)}")
                 st.markdown(f'<div class="section-title">Monthly Sales: {title}</div>', unsafe_allow_html=True)
 
-                chart = (
-                    alt.Chart(trend)
-                    .mark_line(point=True, strokeWidth=3, color="#2563eb")
-                    .encode(
-                        x=alt.X("Month:N", sort=trend["Month"].tolist(), title="Month",
-                                axis=alt.Axis(labelAngle=0)),
-                        y=alt.Y("Value:Q", title=metric),
-                        tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Value:Q", title=metric, format=",.2f")],
-                    )
-                    .properties(height=400)
+                base_chart = alt.Chart(trend).encode(
+                    x=alt.X("Month:N", sort=trend["Month"].tolist(), title="Month",
+                            axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("Value:Q", title=metric),
                 )
+                line = base_chart.mark_line(point=True, strokeWidth=3, color="#2563eb").encode(
+                    tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Value:Q", title=metric, format=",.2f")],
+                )
+                # value shown on every point (sales value or quantity, whichever the chart shows)
+                labels = base_chart.mark_text(dy=-14, fontSize=12, fontWeight="bold", color="#172033").encode(
+                    text=alt.Text("Value:Q", format=",.2f"),
+                )
+                chart = (line + labels).properties(height=400, padding={"top": 24, "right": 12, "left": 5, "bottom": 5})
                 st.altair_chart(chart, use_container_width=True)
 
                 if (view["sold_qty"] < 0).any():
