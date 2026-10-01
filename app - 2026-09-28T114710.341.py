@@ -275,6 +275,12 @@ def money(value):
     return f"Rs. {float(value):,.2f}"
 
 
+def size_label(size):
+    """Display text for a size / variety. Items without a size show '(No size)'."""
+    s = "" if size is None or (isinstance(size, float) and pd.isna(size)) else str(size).strip()
+    return s if s else "(No size)"
+
+
 def month_label(month_key):
     return pd.to_datetime(month_key + "-01").strftime("%B %Y")
 
@@ -321,7 +327,7 @@ def pick_item(pool, key):
     with c2:
         item_id = st.selectbox(
             "Size / Variety", list(lookup.keys()),
-            format_func=lambda x: lookup[x], key=f"{key}_size_{name}"
+            format_func=lambda x: size_label(lookup[x]), key=f"{key}_size_{name}"
         )
     return item_id, name, lookup[item_id]
 
@@ -334,13 +340,15 @@ def item_exists(name, size):
 
 
 def add_item_ui(key):
-    """Add an item and all its sizes / varieties in one go, using a table."""
+    """Add an item and its sizes / varieties in one go, using a table.
+    Sizes are OPTIONAL: leave the table empty for an item that has no size / variety."""
     ver_key = f"{key}_ver"
     st.session_state.setdefault(ver_key, 0)
 
     with st.form(f"{key}_form", clear_on_submit=True):
         name = st.text_input("Item name *", placeholder="Water")
-        st.caption("List its sizes / varieties below. Click the empty bottom row to add more rows.")
+        st.caption("List its sizes / varieties below. Click the empty bottom row to add more rows. "
+                   "**Leave the table empty if this item has no size / variety.**")
         sizes_df = st.data_editor(
             pd.DataFrame({"Size / Variety": ["", "", ""]}),
             num_rows="dynamic", hide_index=True, use_container_width=True,
@@ -358,12 +366,13 @@ def add_item_ui(key):
 
         if not name.strip():
             st.error("Item name is required.")
-        elif not sizes:
-            st.error("Add at least one size / variety.")
         else:
+            if not sizes:
+                sizes = [""]  # item without any size / variety
             items_df = read_table("Items")
             taken = set(
-                items_df.loc[items_df["item_name"].str.lower() == name.strip().lower(), "size"].str.lower()
+                items_df.loc[items_df["item_name"].str.lower() == name.strip().lower(), "size"]
+                .str.strip().str.lower()
             )
             to_add = [s for s in sizes if s.lower() not in taken]
             skipped = [s for s in sizes if s.lower() in taken]
@@ -374,9 +383,10 @@ def add_item_ui(key):
                     for s in to_add
                 ])
                 st.session_state[ver_key] += 1
-                st.success(f"Added {name.strip()}: {', '.join(to_add)}.")
+                st.success(f"Added {name.strip()}: {', '.join(size_label(s) for s in to_add)}.")
             if skipped:
-                st.warning(f"Already exist (skipped, may be inactive): {', '.join(skipped)}.")
+                st.warning(f"Already exist (skipped, may be inactive): "
+                           f"{', '.join(size_label(s) for s in skipped)}.")
 
 
 def header(title, subtitle):
@@ -509,7 +519,7 @@ if page == "Stock Entry":
     else:
         stock_title = f"Closing stock - end of {month_label(mk)}"
 
-    with st.expander("➕ Add a new item with its sizes / varieties"):
+    with st.expander("➕ Add a new item with its sizes / varieties (sizes are optional)"):
         add_item_ui("stock_add")
 
     items = get_items()
@@ -538,7 +548,7 @@ if page == "Stock Entry":
         editor_df = pd.DataFrame({
             "item_id": base["item_id"].values,
             "Item": base["item_name"].values,
-            "Size / Variety": base["size"].values,
+            "Size / Variety": [("" if str(s).strip() == "" else s) for s in base["size"].values],
             "Quantity": base["quantity"].values,
             "Unit Price": base["unit_price"].values,
             "Description": base["description"].values,
@@ -610,7 +620,7 @@ if page == "Stock Entry":
         )
 
         with st.expander("🗑️ Delete a stock entry"):
-            labels = {r["id"]: f'{r["item_name"]} - {r["size"]}' for _, r in entries.iterrows()}
+            labels = {r["id"]: f'{r["item_name"]} - {size_label(r["size"])}' for _, r in entries.iterrows()}
             del_id = st.selectbox("Entry", list(labels.keys()), format_func=lambda x: labels[x], key="del_stock")
             if st.button("Delete Entry", key="del_stock_btn"):
                 delete_row("Stock", del_id)
@@ -618,11 +628,11 @@ if page == "Stock Entry":
 
 
 # ============================================================
-# PURCHASES
+# PURCHASES  (table entry: pick the item, then fill one table for all its sizes)
 # ============================================================
 elif page == "Purchases":
     header("Monthly Purchases",
-           "Record purchases made this month. Items are selected from the PREVIOUS month's stock list.")
+           "Record purchases made this month. Pick an item, then fill the table for its sizes / varieties.")
 
     mk = month_picker("Purchase month", "purch")
     prev = previous_month(mk)
@@ -644,38 +654,72 @@ elif page == "Purchases":
                    f"{month_label(mk)} (Stock Entry → Opening stock) or the closing stock of {month_label(prev)} first, "
                    "or tick the option above to show all items.")
     else:
-        item_id, item_name, size = pick_item(pool, "purch")
+        names = sorted(pool["item_name"].unique())
+        item_name = st.selectbox("Item", names, key="purch_item")
 
-        prev_row = stock_all[(stock_all["month_key"] == prev) & (stock_all["item_id"] == item_id)]
-        if not prev_row.empty:
-            st.caption(f"{month_label(prev)} stock: {float(prev_row.iloc[0]['quantity']):,.2f} "
-                       f"@ {money(prev_row.iloc[0]['unit_price'])}")
-        default_price = float(prev_row.iloc[0]["unit_price"]) if not prev_row.empty else 0.0
+        sizes_pool = pool[pool["item_name"] == item_name].sort_values("size")
+        prev_prices = stock_all[stock_all["month_key"] == prev][["item_id", "unit_price"]] \
+            .rename(columns={"item_id": "id", "unit_price": "prev_price"})
+        sizes_pool = sizes_pool.merge(prev_prices, on="id", how="left")  # suggest last month's price
+
+        n_rows = len(sizes_pool)
+        editor_df = pd.DataFrame({
+            "id": sizes_pool["id"].values,
+            "Size / Variety": sizes_pool["size"].values,
+            "Purchase Quantity": [float("nan")] * n_rows,
+            "Unit Price (Rs.)": sizes_pool["prev_price"].astype(float).values,
+            "Description": [""] * n_rows,
+        })
 
         y, m = int(mk[:4]), int(mk[5:7])
         first_day = date(y, m, 1)
         last_day = date(y, m, calendar.monthrange(y, m)[1])
 
-        with st.form("purchase_form", clear_on_submit=False):
-            a, b, c = st.columns(3)
-            p_date = a.date_input("Purchase Date", value=first_day,
-                                  min_value=first_day, max_value=last_day, key=f"pd_{mk}")
-            qty = b.number_input("Purchase Quantity", min_value=0.0, step=1.0, key=f"pq_{mk}_{item_id}")
-            price = c.number_input("Unit Price (Rs.)", min_value=0.0, step=0.01, format="%.2f",
-                                   value=default_price, key=f"pp_{mk}_{item_id}")
-            desc = st.text_area("Description", key=f"pdesc_{mk}_{item_id}")
+        st.session_state.setdefault("purch_ver", 0)
+        st.caption("Fill Purchase Quantity for the sizes you bought and press **Save Purchase** once - "
+                   "all filled rows are saved together. Leave Quantity empty to skip a row.")
 
-            if st.form_submit_button("Save Purchase", type="primary"):
-                if qty <= 0:
-                    st.error("Purchase quantity must be greater than zero.")
-                else:
-                    add_row("Purchases", {
-                        "id": new_id("P"), "month_key": mk, "purchase_date": p_date.isoformat(),
-                        "item_id": item_id, "quantity": float(qty), "unit_price": float(price),
-                        "description": desc.strip(), "entered_by": user["username"],
-                        "created_at": datetime.now().isoformat(),
-                    })
-                    st.success(f"Purchase saved: {item_name} - {size}.")
+        with st.form("purchase_form", clear_on_submit=False):
+            p_date = st.date_input("Purchase Date", value=first_day,
+                                   min_value=first_day, max_value=last_day, key=f"pd_{mk}")
+            edited = st.data_editor(
+                editor_df,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                disabled=["Size / Variety"],
+                column_config={
+                    "id": None,
+                    "Size / Variety": st.column_config.TextColumn("Size / Variety"),
+                    "Purchase Quantity": st.column_config.NumberColumn(
+                        "Purchase Quantity", min_value=0.0, step=1.0),
+                    "Unit Price (Rs.)": st.column_config.NumberColumn(
+                        "Unit Price (Rs.)", min_value=0.0, format="%.2f"),
+                    "Description": st.column_config.TextColumn("Description"),
+                },
+                key=f"purch_editor_{mk}_{item_name}_{show_all}_{st.session_state['purch_ver']}",
+            )
+            save_clicked = st.form_submit_button("Save Purchase", type="primary")
+
+        if save_clicked:
+            now = datetime.now().isoformat()
+            new_rows = []
+            for _, r in edited.iterrows():
+                if pd.isna(r["Purchase Quantity"]) or float(r["Purchase Quantity"]) <= 0:
+                    continue
+                new_rows.append({
+                    "id": new_id("P"), "month_key": mk, "purchase_date": p_date.isoformat(),
+                    "item_id": r["id"], "quantity": float(r["Purchase Quantity"]),
+                    "unit_price": 0.0 if pd.isna(r["Unit Price (Rs.)"]) else float(r["Unit Price (Rs.)"]),
+                    "description": "" if pd.isna(r["Description"]) else str(r["Description"]).strip(),
+                    "entered_by": user["username"], "created_at": now,
+                })
+            if not new_rows:
+                st.error("Enter a purchase quantity greater than zero for at least one row.")
+            else:
+                add_rows("Purchases", new_rows)
+                st.session_state["purch_ver"] += 1
+                st.success(f"{len(new_rows)} purchase entr{'y' if len(new_rows) == 1 else 'ies'} saved: {item_name}.")
 
     st.markdown(f'<div class="section-title">Purchases in {month_label(mk)}</div>', unsafe_allow_html=True)
 
@@ -701,7 +745,7 @@ elif page == "Purchases":
         )
 
         with st.expander("🗑️ Delete a purchase"):
-            labels = {r["id"]: f'{r["purchase_date"]} • {r["item_name"]} - {r["size"]} • {r["quantity"]:g}'
+            labels = {r["id"]: f'{r["purchase_date"]} • {r["item_name"]} - {size_label(r["size"])} • {r["quantity"]:g}'
                       for _, r in plist.iterrows()}
             del_id = st.selectbox("Purchase", list(labels.keys()), format_func=lambda x: labels[x], key="del_purch")
             if st.button("Delete Purchase", key="del_purch_btn"):
@@ -756,7 +800,9 @@ elif page == "Sales Performance":
                     sel_size = st.selectbox("Size / Variety", ["All sizes"], disabled=True, key="sales_size_all")
                 else:
                     sizes = ["All sizes"] + sorted(df.loc[df["item_name"] == sel_item, "size"].unique().tolist())
-                    sel_size = st.selectbox("Size / Variety", sizes, key=f"sales_size_{sel_item}")
+                    sel_size = st.selectbox(
+                        "Size / Variety", sizes, key=f"sales_size_{sel_item}",
+                        format_func=lambda s: s if s == "All sizes" else size_label(s))
             with f3:
                 metric = st.radio("Chart shows", ["Total Sales (Rs.)", "Quantity Sold"],
                                   horizontal=True, key="sales_metric")
@@ -793,7 +839,7 @@ elif page == "Sales Performance":
                         )
 
                 title = "All items" if sel_item == "All items" else (
-                    sel_item if sel_size == "All sizes" else f"{sel_item} - {sel_size}")
+                    sel_item if sel_size == "All sizes" else f"{sel_item} - {size_label(sel_size)}")
                 st.markdown(f'<div class="section-title">Monthly Sales: {title}</div>', unsafe_allow_html=True)
 
                 chart = (
@@ -934,7 +980,8 @@ elif page == "Settings":
         )
 
         if not all_items.empty:
-            labels = {r["id"]: f'{r["item_name"]} - {r["size"]} ({r["Status"]})' for _, r in all_items.iterrows()}
+            labels = {r["id"]: f'{r["item_name"]} - {size_label(r["size"])} ({r["Status"]})'
+                      for _, r in all_items.iterrows()}
             sel_i = st.selectbox("Select item", list(labels.keys()), format_func=lambda x: labels[x], key="manage_item")
             is_active = int(all_items[all_items["id"] == sel_i].iloc[0]["active"]) == 1
             if st.button("Deactivate Item" if is_active else "Reactivate Item"):
