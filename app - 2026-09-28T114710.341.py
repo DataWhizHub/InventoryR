@@ -69,8 +69,12 @@ div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea { bo
 #MainMenu { visibility: hidden; }
 header[data-testid="stHeader"] { background: transparent !important; pointer-events: none; }
 header[data-testid="stHeader"] button, header[data-testid="stHeader"] a { pointer-events: auto; }
-[data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"],
-.stDeployButton { display: none !important; }
+[data-testid="stToolbarActions"], [data-testid="stMainMenu"], [data-testid="stAppDeployButton"],
+[data-testid="stDecoration"], [data-testid="stStatusWidget"], .stDeployButton { display: none !important; }
+/* keep the "open sidebar" arrow visible and clickable after the sidebar is hidden */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"] { display: flex !important; visibility: visible !important;
+    pointer-events: auto !important; z-index: 999999; }
 footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
