@@ -795,11 +795,14 @@ elif page == "Purchases":
 elif page == "Sales Performance":
     header("Sales Performance",
            "Quantity sold = Previous month stock + This month purchases − This month stock. "
-           "Sales value = Quantity sold × this month's unit price.")
+           "Sales value = (Previous stock × its unit price) + (Purchases × their unit price) "
+           "− (This month stock × its unit price).")
 
     stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price"]] \
         .rename(columns={"quantity": "closing_qty"})
-    purch = read_table("Purchases").groupby(["month_key", "item_id"], as_index=False)["quantity"].sum() \
+    purch_raw = read_table("Purchases").copy()
+    purch_raw["purchase_value"] = purch_raw["quantity"] * purch_raw["unit_price"]
+    purch = purch_raw.groupby(["month_key", "item_id"], as_index=False)[["quantity", "purchase_value"]].sum() \
         .rename(columns={"quantity": "purchase_qty"})
     items_all = items_lookup()[["item_id", "item_name", "size"]]
 
@@ -807,20 +810,25 @@ elif page == "Sales Performance":
         st.info("No stock has been entered yet.")
     else:
         stock["prev_key"] = stock["month_key"].map(previous_month)
-        prev_stock = stock[["month_key", "item_id", "closing_qty"]].rename(
-            columns={"month_key": "prev_key", "closing_qty": "opening_qty"}
+        prev_stock = stock[["month_key", "item_id", "closing_qty", "unit_price"]].rename(
+            columns={"month_key": "prev_key", "closing_qty": "opening_qty", "unit_price": "opening_price"}
         )
 
         df = stock.merge(prev_stock, on=["prev_key", "item_id"], how="left")
         # Only months where the previous month's stock exists can be calculated
         df = df[df["prev_key"].isin(set(stock["month_key"]))].copy()
         df["opening_qty"] = df["opening_qty"].fillna(0.0)
+        df["opening_price"] = df["opening_price"].fillna(0.0)
         df = df.merge(purch, on=["month_key", "item_id"], how="left")
         df["purchase_qty"] = df["purchase_qty"].fillna(0.0)
+        df["purchase_value"] = df["purchase_value"].fillna(0.0)
         df = df.merge(items_all, on="item_id", how="left")
 
         df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
-        df["sales_value"] = df["sold_qty"] * df["unit_price"]
+        # Value-based: previous stock at ITS unit price + purchases at their prices - this month's stock at its price
+        df["opening_value"] = df["opening_qty"] * df["opening_price"]
+        df["closing_value"] = df["closing_qty"] * df["unit_price"]
+        df["sales_value"] = df["opening_value"] + df["purchase_value"] - df["closing_value"]
 
         if df.empty:
             st.info("Sales need at least two consecutive months of stock entries "
@@ -897,13 +905,17 @@ elif page == "Sales Performance":
 
                 st.markdown('<div class="section-title">Details</div>', unsafe_allow_html=True)
                 table = view.sort_values(["month_key", "item_name", "size"])[
-                    ["month_key", "item_name", "size", "opening_qty", "purchase_qty",
-                     "closing_qty", "sold_qty", "unit_price", "sales_value"]
+                    ["month_key", "item_name", "size", "opening_qty", "opening_price", "opening_value",
+                     "purchase_qty", "purchase_value", "closing_qty", "unit_price", "closing_value",
+                     "sold_qty", "sales_value"]
                 ].rename(columns={
                     "month_key": "Month", "item_name": "Item", "size": "Size / Variety",
-                    "opening_qty": "Previous Stock", "purchase_qty": "Purchases",
-                    "closing_qty": "This Month Stock", "sold_qty": "Quantity Sold",
-                    "unit_price": "Unit Price", "sales_value": "Sales Value",
+                    "opening_qty": "Previous Stock", "opening_price": "Previous Unit Price",
+                    "opening_value": "Previous Stock Value",
+                    "purchase_qty": "Purchases", "purchase_value": "Purchases Value",
+                    "closing_qty": "This Month Stock", "unit_price": "Unit Price",
+                    "closing_value": "This Month Stock Value",
+                    "sold_qty": "Quantity Sold", "sales_value": "Sales Value",
                 })
                 st.dataframe(table, use_container_width=True, hide_index=True)
 
