@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 MAX_STANDARD_USERS = 3  # 1 Admin + up to 3 normal users
-CACHE_SECONDS = 20      # how long sheet data is cached (protects the Google API quota)
+CACHE_SECONDS = 300     # sheet data is cached; a save refreshes only the table that changed
 
 # ------------------------- THEME ----------------------------
 st.markdown("""
@@ -67,6 +67,10 @@ section[data-testid="stSidebar"] button:hover { background: #334766 !important; 
 div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea { border-radius: 8px !important; }
 [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
 #MainMenu { visibility: hidden; }
+header[data-testid="stHeader"] { background: transparent !important; pointer-events: none; }
+header[data-testid="stHeader"] button, header[data-testid="stHeader"] a { pointer-events: auto; }
+[data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"],
+.stDeployButton { display: none !important; }
 footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -128,8 +132,14 @@ def _clean(v):
     return v
 
 
+@st.cache_resource
+def _table_versions():
+    """Shared version counter per table. A save bumps only that table, so only it is re-read."""
+    return {name: 0 for name in TABLES}
+
+
 @st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
-def read_table(name):
+def _read_table_cached(name, version):
     ws = get_worksheets()[name]
     values = ws.get_all_values()
     headers = TABLES[name]
@@ -147,6 +157,20 @@ def read_table(name):
     return df
 
 
+def read_table(name):
+    return _read_table_cached(name, _table_versions()[name])
+
+
+def _clear_tables(name=None):
+    """Refresh one table (name) or all tables (no argument)."""
+    v = _table_versions()
+    for t in ([name] if name else list(v)):
+        v[t] += 1
+
+
+read_table.clear = _clear_tables
+
+
 def new_id(prefix):
     return f"{prefix}-{secrets.token_hex(4)}"
 
@@ -155,7 +179,7 @@ def add_row(name, data):
     ws = get_worksheets()[name]
     row = [_clean(data.get(h, "")) for h in TABLES[name]]
     ws.append_row(row, value_input_option="RAW")
-    read_table.clear()
+    read_table.clear(name)
 
 
 def update_row(name, row_id, changes):
@@ -170,7 +194,7 @@ def update_row(name, row_id, changes):
         for k, v in changes.items()
     ]
     ws.batch_update(batch, value_input_option="RAW")
-    read_table.clear()
+    read_table.clear(name)
     return True
 
 
@@ -179,7 +203,7 @@ def delete_row(name, row_id):
     ids = ws.col_values(1)
     if row_id in ids:
         ws.delete_rows(ids.index(row_id) + 1)
-    read_table.clear()
+    read_table.clear(name)
 
 
 def find_stock_id(month_key, item_id):
@@ -198,7 +222,7 @@ def add_rows(name, rows):
     ws = get_worksheets()[name]
     data = [[_clean(r.get(h, "")) for h in TABLES[name]] for r in rows]
     ws.append_rows(data, value_input_option="RAW")
-    read_table.clear()
+    read_table.clear(name)
 
 
 def save_stock_batch(month_key, rows, entered_by):
@@ -236,7 +260,7 @@ def save_stock_batch(month_key, rows, entered_by):
         ws.batch_update(updates, value_input_option="RAW")
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW")
-    read_table.clear()
+    read_table.clear("Stock")
 
 
 # Connect now and show a friendly message if setup is incomplete
@@ -400,11 +424,22 @@ def normal_user_count():
 
 
 # ------------------------- AUTHENTICATION -------------------
+def center_page_css():
+    """Centre the login / registration block in the middle of the page."""
+    st.markdown("""
+<style>
+.block-container { min-height: 92vh; display: flex; flex-direction: column; justify-content: center; }
+.login-logo, .login-caption { text-align: center; }
+</style>
+""", unsafe_allow_html=True)
+
+
 def registration_exists():
     return len(read_table("Users")) > 0
 
 
 def registration_page():
+    center_page_css()
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown('<div class="login-logo">🍽️ Restaurant Inventory</div>', unsafe_allow_html=True)
@@ -439,6 +474,7 @@ def registration_page():
 
 
 def login_page():
+    center_page_css()
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown('<div class="login-logo">🍽️ Restaurant Inventory</div>', unsafe_allow_html=True)
@@ -569,7 +605,7 @@ if page == "Stock Entry":
                     "item_id": None,
                     "Quantity": st.column_config.NumberColumn(
                         "Quantity (opening stock)" if is_opening else "Quantity (closing stock)",
-                        min_value=0.0, step=1.0),
+                        min_value=0.0, step=0.01, format="%.2f"),
                     "Unit Price": st.column_config.NumberColumn("Unit Price (Rs.)", min_value=0.0, format="%.2f"),
                     "Description": st.column_config.TextColumn("Description"),
                 },
@@ -692,7 +728,7 @@ elif page == "Purchases":
                     "id": None,
                     "Size / Variety": st.column_config.TextColumn("Size / Variety"),
                     "Purchase Quantity": st.column_config.NumberColumn(
-                        "Purchase Quantity", min_value=0.0, step=1.0),
+                        "Purchase Quantity", min_value=0.0, step=0.01, format="%.2f"),
                     "Unit Price (Rs.)": st.column_config.NumberColumn(
                         "Unit Price (Rs.)", min_value=0.0, format="%.2f"),
                     "Description": st.column_config.TextColumn("Description"),
