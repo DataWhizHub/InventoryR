@@ -358,8 +358,16 @@ def category_list():
     return sorted(c for c in df["category"].astype(str).str.strip().unique() if c)
 
 
+def next_item_codes(count):
+    """Next `count` item codes: 0001, 0002, ... continuing after the highest numeric code in use."""
+    codes = read_table("Items")["item_code"].astype(str).str.strip()
+    nums = [int(c) for c in codes if c.isdigit()]
+    start = (max(nums) if nums else 0) + 1
+    return [f"{n:04d}" for n in range(start, start + count)]
+
+
 def add_item_ui(key):
-    """Add an item with a Main Category and one Item Code per size / variety."""
+    """Add an item with a Main Category. Item Codes (0001, 0002, ...) are generated automatically."""
     ver_key = f"{key}_ver"
     st.session_state.setdefault(ver_key, 0)
     cats = category_list()
@@ -369,11 +377,12 @@ def add_item_ui(key):
         name = a.text_input("Item name *", placeholder="Water")
         cat_sel = b.selectbox("Main category", ["(choose)"] + cats)
         cat_new = c.text_input("...or new category", placeholder="Beverages")
-        st.caption("One row per size / variety, each with its own Item Code. "
-                   "For an item with no size, fill only the code. "
+        st.caption("One row per size / variety. Item Codes are generated automatically "
+                   f"(next code: {next_item_codes(1)[0]}). "
+                   "For an item with no size, leave the table empty. "
                    "Click the empty bottom row to add more rows.")
         rows_df = st.data_editor(
-            pd.DataFrame({"Item Code": ["", "", ""], "Size / Variety": ["", "", ""]}),
+            pd.DataFrame({"Size / Variety": ["", "", ""]}),
             num_rows="dynamic", hide_index=True, use_container_width=True,
             key=f"{key}_sizes_{st.session_state[ver_key]}",
         )
@@ -381,32 +390,23 @@ def add_item_ui(key):
 
     if submitted:
         category = cat_new.strip() or ("" if cat_sel == "(choose)" else cat_sel)
-        rows = []
-        for _, r in rows_df.fillna("").astype(str).iterrows():
-            code, size = r["Item Code"].strip(), r["Size / Variety"].strip()
-            if code or size:
-                rows.append((code, size))
-        codes = [c for c, _ in rows]
-        taken = set(read_table("Items")["item_code"].str.strip().str.lower())
+        sizes = [s.strip() for s in rows_df["Size / Variety"].fillna("").astype(str) if s.strip()]
+        if not sizes:
+            sizes = [""]  # item without a size / variety
 
         if not name.strip():
             st.error("Item name is required.")
         elif not category:
             st.error("Choose or type a main category.")
-        elif not rows:
-            st.error("Enter at least one Item Code.")
-        elif any(not c for c in codes):
-            st.error("Every row needs an Item Code.")
-        elif len({c.lower() for c in codes}) != len(codes):
-            st.error("The same Item Code is used twice.")
-        elif any(c.lower() in taken for c in codes):
-            st.error("These Item Codes already exist: " +
-                     ", ".join(c for c in codes if c.lower() in taken))
+        elif len({s.lower() for s in sizes}) != len(sizes):
+            st.error("The same size / variety is entered twice.")
         else:
+            read_table.clear("Items")  # fresh read so codes are never reused
+            codes = next_item_codes(len(sizes))
             add_rows("Items", [
-                {"id": new_id("I"), "item_code": c, "item_name": name.strip(),
+                {"id": new_id("I"), "item_code": code, "item_name": name.strip(),
                  "size": s, "category": category, "active": 1}
-                for c, s in rows
+                for code, s in zip(codes, sizes)
             ])
             st.session_state[ver_key] += 1
             st.success(f"Added {name.strip()} ({category}): {', '.join(codes)}.")
