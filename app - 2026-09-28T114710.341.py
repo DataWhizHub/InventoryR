@@ -1069,9 +1069,20 @@ elif page == "Sales Performance":
                 chart = (line + labels).properties(height=400, padding={"top": 24, "right": 12, "left": 5, "bottom": 5})
                 st.altair_chart(chart, use_container_width=True)
 
-                if (view["sold_qty"] < 0).any():
-                    st.warning("Some rows have a negative quantity sold. "
-                               "Check the stock or purchase entries for those items.")
+                neg = view[view["sold_qty"] < 0]
+                if not neg.empty:
+                    st.warning(f"{len(neg)} row(s) have a negative quantity sold. "
+                               "Check the stock or purchase entries for these items.")
+                    neg_table = neg.sort_values(["month_key", "category", "item_name", "size"])[
+                        ["month_key", "item_code", "category", "item_name", "size",
+                         "opening_qty", "purchase_qty", "closing_qty", "sold_qty"]
+                    ].rename(columns={
+                        "month_key": "Month", "item_code": "Code", "category": "Main Category",
+                        "item_name": "Item", "size": "Size / Variety",
+                        "opening_qty": "Previous Stock", "purchase_qty": "Purchases",
+                        "closing_qty": "This Month Stock", "sold_qty": "Quantity Sold",
+                    })
+                    st.dataframe(neg_table, use_container_width=True, hide_index=True)
 
                 st.markdown('<div class="section-title">Details</div>', unsafe_allow_html=True)
                 table = view.sort_values(["month_key", "category", "item_name", "size"])[
