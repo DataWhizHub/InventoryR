@@ -422,6 +422,160 @@ def normal_user_count():
     return int(((u["role"] != "Admin") & (u["active"] == 1)).sum())
 
 
+def build_sales_report_pdf(rows, month_key):
+    """Monthly Sales Report PDF: category / item, previous stock, purchases, this month stock, sold, sales."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+
+    mname = calendar.month_name[int(month_key[5:7])]
+    pname = calendar.month_name[int(previous_month(month_key)[5:7])]
+    cell = ParagraphStyle("cell", fontName="Helvetica", fontSize=8, leading=10)
+    cell_c = ParagraphStyle("cell_c", parent=cell, alignment=1)
+
+    data = [
+        [f"Monthly Sales Report - {month_label(month_key)}"] + [""] * 9,
+        ["Main Category", "Item with Size/Variety", f"{pname} End Stock", "", f"{mname} Purchases", "",
+         f"{mname} End Stock", "", "Total", ""],
+        ["", "", "Quantity", "Unit Price", "Quantity", "Unit Price", "Quantity", "Unit Price",
+         "Sold Quantity", "Sales"],
+    ]
+    style = [
+        ("SPAN", (0, 0), (9, 0)),
+        ("SPAN", (0, 1), (0, 2)), ("SPAN", (1, 1), (1, 2)),
+        ("SPAN", (2, 1), (3, 1)), ("SPAN", (4, 1), (5, 1)),
+        ("SPAN", (6, 1), (7, 1)), ("SPAN", (8, 1), (9, 1)),
+        ("FONTNAME", (0, 0), (-1, 2), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 2), 8),
+        ("FONTSIZE", (0, 0), (9, 0), 11),
+        ("ALIGN", (0, 0), (-1, 2), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (-1, 2), colors.HexColor("#eef2f7")),
+        ("FONTSIZE", (0, 3), (-1, -1), 8),
+        ("ALIGN", (2, 3), (-1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+
+    rows = rows.sort_values(["category", "item_name", "size"])
+    r = 3
+    for cat, grp in rows.groupby("category", sort=False):
+        start = r
+        for i, (_, x) in enumerate(grp.iterrows()):
+            size = str(x["size"]).strip()
+            label = f'{x["item_name"]} - {size}' if size else str(x["item_name"])
+            p_price = (x["purchase_value"] / x["purchase_qty"]) if x["purchase_qty"] > 0 else 0.0
+            data.append([
+                Paragraph(str(cat).strip(), cell_c) if i == 0 else "",
+                Paragraph(label, cell),
+                f'{x["opening_qty"]:,.2f}', f'{x["opening_price"]:,.2f}',
+                f'{x["purchase_qty"]:,.2f}', f'{p_price:,.2f}',
+                f'{x["closing_qty"]:,.2f}', f'{x["unit_price"]:,.2f}',
+                f'{x["sold_qty"]:,.2f}', f'{x["sales_value"]:,.2f}',
+            ])
+            r += 1
+        if r - start > 1:
+            style.append(("SPAN", (0, start), (0, r - 1)))
+
+    last_data = r - 1
+    data.append([""] * 7 + ["Total", f'{rows["sold_qty"].sum():,.2f}', f'{rows["sales_value"].sum():,.2f}'])
+    style += [
+        ("GRID", (0, 0), (-1, last_data), 0.5, colors.black),
+        ("GRID", (7, r), (9, r), 0.5, colors.black),
+        ("FONTNAME", (7, r), (9, r), "Helvetica-Bold"),
+    ]
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=30, rightMargin=30,
+                            topMargin=30, bottomMargin=30)
+    widths = [80, 130] + [71] * 8
+    table = Table(data, colWidths=widths, repeatRows=3)
+    table.setStyle(TableStyle(style))
+    doc.build([table])
+    return buf.getvalue()
+
+
+def build_sales_report_pdf(rep, mk):
+    """
+    Monthly Sales Report PDF (landscape A4) for month `mk`.
+    rep: rows of the Sales Performance calculation for that month.
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
+    cur_name = calendar.month_name[int(mk[5:7])]
+    prev_name = calendar.month_name[int(previous_month(mk)[5:7])]
+
+    rep = rep.sort_values(["category", "item_name", "size"]).copy()
+    rep["label"] = [n if str(s).strip() == "" else f"{n} - {str(s).strip()}"
+                    for n, s in zip(rep["item_name"], rep["size"])]
+    rep["purchase_price"] = [(v / q) if q else 0.0 for v, q in zip(rep["purchase_value"], rep["purchase_qty"])]
+
+    def n2(x):
+        return f"{float(x):,.2f}"
+
+    data = [
+        ["Main Category", "Item with Size/Variety", f"{prev_name} End Stock", "",
+         f"{cur_name} Purchases", "", f"{cur_name} End Stock", "", "Total", ""],
+        ["", "", "Quantity", "Unit Price", "Quantity", "Unit Price", "Quantity", "Unit Price",
+         "Sold Quantity", "Sales"],
+    ]
+    spans = [("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (3, 0)),
+             ("SPAN", (4, 0), (5, 0)), ("SPAN", (6, 0), (7, 0)), ("SPAN", (8, 0), (9, 0))]
+
+    start, last_cat = 2, None
+    for i, (_, r) in enumerate(rep.iterrows()):
+        row_no = 2 + i
+        cat = str(r["category"]).strip()
+        if cat != last_cat:
+            if last_cat is not None and row_no - 1 > start:
+                spans.append(("SPAN", (0, start), (0, row_no - 1)))
+            start, last_cat = row_no, cat
+        data.append([
+            cat, r["label"],
+            n2(r["opening_qty"]), n2(r["opening_price"]),
+            n2(r["purchase_qty"]), n2(r["purchase_price"]),
+            n2(r["closing_qty"]), n2(r["unit_price"]),
+            n2(r["sold_qty"]), n2(r["sales_value"]),
+        ])
+        if i == len(rep) - 1 and row_no > start:
+            spans.append(("SPAN", (0, start), (0, row_no)))
+
+    total_row = len(data)
+    data.append(["Total", "", "", "", "", "", "", "", n2(rep["sold_qty"].sum()), n2(rep["sales_value"].sum())])
+    spans.append(("SPAN", (0, total_row), (7, total_row)))
+
+    widths = [85, 135, 55, 55, 55, 55, 55, 55, 80, 95]
+    table = Table(data, colWidths=widths, repeatRows=2)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+        ("FONTNAME", (0, total_row), (-1, total_row), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("ALIGN", (0, 0), (-1, 1), "CENTER"),
+        ("ALIGN", (2, 2), (-1, -1), "RIGHT"),
+        ("ALIGN", (0, total_row), (7, total_row), "RIGHT"),
+        ("ALIGN", (0, 2), (0, total_row - 1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor("#e8eef7")),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ] + spans))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=28, rightMargin=28,
+                            topMargin=28, bottomMargin=28,
+                            title=f"Monthly Sales Report - {cur_name} {mk[:4]}")
+    styles = getSampleStyleSheet()
+    title_style = styles["Heading2"]
+    title_style.alignment = 1
+    doc.build([Paragraph(f"Monthly Sales Report - {cur_name} {mk[:4]}", title_style),
+               Spacer(1, 8), table])
+    return buf.getvalue()
+
+
 # ------------------------- DATA IMPORT ----------------------
 MONTH_NUM = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 BLOCK_RE = re.compile(r"(opening stock|closing stock|purchases)\s*\(\s*([a-z]+)\s+(\d{4})\s*\)", re.I)
@@ -995,6 +1149,8 @@ elif page == "Sales Performance":
             st.info("Sales need at least two consecutive months of stock entries "
                     "(previous month and this month).")
         else:
+            df_all = df.copy()  # unfiltered data, used by the PDF report below
+
             # ---- Filters ----
             f0, f1, f2, f3 = st.columns([1.1, 1.3, 1.3, 1.4])
             with f0:
@@ -1108,6 +1264,21 @@ elif page == "Sales Performance":
                     "Download Excel", out.getvalue(), "sales_performance.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+
+            # ---- Monthly Sales Report (PDF) - all items, independent of the filters above ----
+            st.markdown('<div class="section-title">Monthly Sales Report (PDF)</div>', unsafe_allow_html=True)
+            report_months = sorted(df_all["month_key"].unique().tolist(), reverse=True)
+            rep_mk = st.selectbox("Report month", report_months, format_func=month_label, key="report_month")
+            rep = df_all[df_all["month_key"] == rep_mk]
+            try:
+                pdf_bytes = build_sales_report_pdf(rep, rep_mk)
+                st.download_button(
+                    f"📄 Download Monthly Sales Report - {month_label(rep_mk)} (PDF)",
+                    pdf_bytes, f"monthly_sales_report_{rep_mk}.pdf", "application/pdf",
+                    key="report_pdf_btn",
+                )
+            except ImportError:
+                st.error("PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and reboot the app.")
 
 
 # ============================================================
