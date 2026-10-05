@@ -209,6 +209,27 @@ def update_row(name, row_id, changes):
     return True
 
 
+def update_rows(name, changes_by_id):
+    """Update many existing rows at once: {row_id: {column: new_value}}. One read + one write."""
+    if not changes_by_id:
+        return 0
+    ws = get_worksheets()[name]
+    ids = ws.col_values(1)
+    headers = TABLES[name]
+    batch, done = [], 0
+    for rid, changes in changes_by_id.items():
+        if rid not in ids:
+            continue
+        r = ids.index(rid) + 1
+        for k, v in changes.items():
+            batch.append({"range": rowcol_to_a1(r, headers.index(k) + 1), "values": [[_clean(v)]]})
+        done += 1
+    if batch:
+        ws.batch_update(batch, value_input_option="RAW")
+    read_table.clear(name)
+    return done
+
+
 def delete_row(name, row_id):
     ws = get_worksheets()[name]
     ids = ws.col_values(1)
@@ -785,6 +806,9 @@ if page == "Stock Entry":
     # Entries of the selected month
     st.markdown(f'<div class="section-title">{stock_title}</div>',
                 unsafe_allow_html=True)
+    _flash = st.session_state.pop("flash_stock", None)
+    if _flash:
+        st.success(_flash)
 
     stock_all = read_table("Stock")
     entries = stock_all[stock_all["month_key"] == sk].merge(items_lookup(), on="item_id", how="left")
@@ -814,6 +838,63 @@ if page == "Stock Entry":
             if st.button("Delete Entry", key="del_stock_btn"):
                 delete_row("Stock", del_id)
                 st.rerun()
+
+        # ---- Update saved entries (edit quantity / price / description and save) ----
+        with st.expander("✏️ Update stock entries"):
+            st.session_state.setdefault("stock_upd_ver", 0)
+            st.caption(f"{stock_title}: change Quantity, Unit Price or Description of saved rows, "
+                       "then press **Save Changes**. Only rows you changed are updated. "
+                       "To remove a row, use the delete section above.")
+            upd_src = pd.DataFrame({
+                "id": entries["id"].values,
+                "Code": entries["item_code"].values,
+                "Item": entries["item_name"].values,
+                "Size / Variety": entries["size"].values,
+                "Quantity": entries["quantity"].astype(float).values,
+                "Unit Price": entries["unit_price"].astype(float).values,
+                "Description": entries["description"].fillna("").astype(str).values,
+            })
+            with st.form("stock_update_form"):
+                upd = st.data_editor(
+                    upd_src, hide_index=True, use_container_width=True, num_rows="fixed",
+                    disabled=["Code", "Item", "Size / Variety"],
+                    column_config={
+                        "id": None,
+                        "Quantity": st.column_config.NumberColumn(
+                            "Quantity", min_value=0.0, step=0.01, format="%.2f"),
+                        "Unit Price": st.column_config.NumberColumn(
+                            "Unit Price (Rs.)", min_value=0.0, format="%.2f"),
+                        "Description": st.column_config.TextColumn("Description"),
+                    },
+                    key=f"stock_upd_{sk}_{st.session_state['stock_upd_ver']}",
+                )
+                upd_clicked = st.form_submit_button("Save Changes", type="primary")
+
+            if upd_clicked:
+                now, changes, skipped = datetime.now().isoformat(), {}, 0
+                for i in range(len(upd_src)):
+                    o, n = upd_src.iloc[i], upd.iloc[i]
+                    if pd.isna(n["Quantity"]):
+                        skipped += 1
+                        continue
+                    nq = float(n["Quantity"])
+                    np_ = 0.0 if pd.isna(n["Unit Price"]) else float(n["Unit Price"])
+                    nd = "" if pd.isna(n["Description"]) else str(n["Description"]).strip()
+                    if (abs(nq - o["Quantity"]) > 1e-9 or abs(np_ - o["Unit Price"]) > 1e-9
+                            or nd != str(o["Description"]).strip()):
+                        changes[o["id"]] = {"quantity": nq, "unit_price": np_, "description": nd,
+                                            "entered_by": user["username"], "updated_at": now}
+                if skipped:
+                    st.error(f"{skipped} row(s) have an empty Quantity. Enter a quantity (0 if out of stock). "
+                             "Nothing was saved.")
+                elif not changes:
+                    st.info("No changes to save.")
+                else:
+                    n_done = update_rows("Stock", changes)
+                    st.session_state["stock_upd_ver"] += 1
+                    st.session_state["flash_stock"] = (
+                        f"{n_done} stock entr{'y' if n_done == 1 else 'ies'} updated: {stock_title}.")
+                    st.rerun()
 
 
 # ============================================================
@@ -917,6 +998,9 @@ elif page == "Purchases":
                 st.success(f"{len(new_rows)} purchase entr{'y' if len(new_rows) == 1 else 'ies'} saved: {item_name}.")
 
     st.markdown(f'<div class="section-title">Purchases in {month_label(mk)}</div>', unsafe_allow_html=True)
+    _flash = st.session_state.pop("flash_purch", None)
+    if _flash:
+        st.success(_flash)
 
     purch_all = read_table("Purchases")
     plist = purch_all[purch_all["month_key"] == mk].merge(items_lookup(), on="item_id", how="left")
@@ -947,6 +1031,63 @@ elif page == "Purchases":
             if st.button("Delete Purchase", key="del_purch_btn"):
                 delete_row("Purchases", del_id)
                 st.rerun()
+
+        # ---- Update saved purchases (edit quantity / price / description and save) ----
+        with st.expander("✏️ Update purchases"):
+            st.session_state.setdefault("purch_upd_ver", 0)
+            st.caption(f"Purchases in {month_label(mk)}: change Quantity, Unit Price or Description, "
+                       "then press **Save Changes**. Only rows you changed are updated. "
+                       "To remove a purchase, use the delete section above.")
+            upd_src = pd.DataFrame({
+                "id": plist["id"].values,
+                "Date": plist["purchase_date"].values,
+                "Code": plist["item_code"].values,
+                "Item": plist["item_name"].values,
+                "Size / Variety": plist["size"].values,
+                "Quantity": plist["quantity"].astype(float).values,
+                "Unit Price": plist["unit_price"].astype(float).values,
+                "Description": plist["description"].fillna("").astype(str).values,
+            })
+            with st.form("purch_update_form"):
+                upd = st.data_editor(
+                    upd_src, hide_index=True, use_container_width=True, num_rows="fixed",
+                    disabled=["Date", "Code", "Item", "Size / Variety"],
+                    column_config={
+                        "id": None,
+                        "Quantity": st.column_config.NumberColumn(
+                            "Quantity", min_value=0.0, step=0.01, format="%.2f"),
+                        "Unit Price": st.column_config.NumberColumn(
+                            "Unit Price (Rs.)", min_value=0.0, format="%.2f"),
+                        "Description": st.column_config.TextColumn("Description"),
+                    },
+                    key=f"purch_upd_{mk}_{st.session_state['purch_upd_ver']}",
+                )
+                upd_clicked = st.form_submit_button("Save Changes", type="primary")
+
+            if upd_clicked:
+                changes, bad = {}, 0
+                for i in range(len(upd_src)):
+                    o, n = upd_src.iloc[i], upd.iloc[i]
+                    if pd.isna(n["Quantity"]) or float(n["Quantity"]) <= 0:
+                        bad += 1
+                        continue
+                    nq = float(n["Quantity"])
+                    np_ = 0.0 if pd.isna(n["Unit Price"]) else float(n["Unit Price"])
+                    nd = "" if pd.isna(n["Description"]) else str(n["Description"]).strip()
+                    if (abs(nq - o["Quantity"]) > 1e-9 or abs(np_ - o["Unit Price"]) > 1e-9
+                            or nd != str(o["Description"]).strip()):
+                        changes[o["id"]] = {"quantity": nq, "unit_price": np_, "description": nd}
+                if bad:
+                    st.error(f"{bad} row(s) have an empty or zero Quantity. Enter a quantity above zero, "
+                             "or delete that purchase. Nothing was saved.")
+                elif not changes:
+                    st.info("No changes to save.")
+                else:
+                    n_done = update_rows("Purchases", changes)
+                    st.session_state["purch_upd_ver"] += 1
+                    st.session_state["flash_purch"] = (
+                        f"{n_done} purchase{'' if n_done == 1 else 's'} updated in {month_label(mk)}.")
+                    st.rerun()
 
 
 # ============================================================
