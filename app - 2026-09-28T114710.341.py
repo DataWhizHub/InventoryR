@@ -511,6 +511,27 @@ def parse_import_tab():
     return {"items": items, "stock": stock, "purchases": purch, "issues": issues}
 
 
+def create_import_tab():
+    """Create the Rest_Import tab with the two header rows. Returns False if it already exists."""
+    sh = get_spreadsheet()
+    if IMPORT_TAB.lower() in [w.title.strip().lower() for w in sh.worksheets()]:
+        return False
+    groups = ["Opening Stock (April 2026)",
+              "Purchases (April 2026)", "Closing Stock (April 2026)",
+              "Purchases (May 2026)", "Closing Stock (May 2026)",
+              "Purchases (June 2026)", "Closing Stock (June 2026)"]
+    row1 = ["Item Code", "Main Category", "Item", "Size"]
+    row2 = ["", "", "", ""]
+    for g in groups:
+        row1 += [g, "", ""]
+        row2 += ["Qty", "Unit Price", "Total"]
+    ws = sh.add_worksheet(title=IMPORT_TAB, rows=300, cols=len(row1))
+    ws.format("A:A", {"numberFormat": {"type": "TEXT"}})  # keep codes like 001 as text
+    ws.update(range_name="A1", values=[row1, row2], value_input_option="RAW")
+    ws.freeze(rows=2)
+    return True
+
+
 def run_import(imp, username):
     items_df = read_table("Items")
     code_to_id = dict(zip(items_df["item_code"].str.strip(), items_df["id"]))
@@ -1216,6 +1237,13 @@ elif page == "Settings":
             "'Opening Stock (April 2026)', 'Purchases (April 2026)', 'Closing Stock (April 2026)'; "
             "row 2 = Qty / Unit Price / Total; data from row 3). Then read and check it here."
         )
+        if st.button(f"➕ Create the {IMPORT_TAB} tab with headers"):
+            if create_import_tab():
+                st.success(f"Tab {IMPORT_TAB} created. Open your Google Sheet and paste your data from row 3 "
+                           "(columns A-D: Item Code, Main Category, Item, Size; then Qty / Unit Price / Total).")
+            else:
+                st.info(f"The {IMPORT_TAB} tab already exists.")
+
         if st.button("🔍 Read & check Rest_Import"):
             try:
                 st.session_state["imp"] = parse_import_tab()
