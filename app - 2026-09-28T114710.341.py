@@ -7,6 +7,7 @@ import hmac
 import secrets
 import calendar
 import io
+import re
 from datetime import date, datetime
 from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
@@ -18,7 +19,7 @@ from gspread.utils import rowcol_to_a1
 #   Stock Entry       : month-end stock (item, size, qty, unit price, description)
 #   Purchases         : purchases of the month (from previous month's stock items)
 #   Sales Performance : Sold = Previous month stock + Purchases - This month stock
-#   Settings          : admin creates / manages user logins
+#   Settings          : users, items (code + main category), password, data import
 # ============================================================
 
 st.set_page_config(
@@ -85,7 +86,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TABLES = {
     "Users": ["id", "username", "password", "full_name", "role", "active", "created_at"],
-    "Items": ["id", "item_name", "size", "active"],
+    "Items": ["id", "item_code", "item_name", "size", "category", "active"],
     "Stock": ["id", "month_key", "item_id", "quantity", "unit_price",
               "description", "entered_by", "updated_at"],
     "Purchases": ["id", "month_key", "purchase_date", "item_id", "quantity", "unit_price",
@@ -96,15 +97,21 @@ NUMERIC_COLS = ["quantity", "unit_price"]
 # Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases so they never
 # clash with tabs from your other apps if you reuse the same Google Sheet file.
 TAB_PREFIX = "Rest_"
+IMPORT_TAB = "Rest_Import"  # paste your old data here, then import from Settings > Import Data
+
+
+@st.cache_resource
+def get_spreadsheet():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SCOPES
+    )
+    return gspread.authorize(creds).open_by_key(st.secrets["sheet_id"])
 
 
 @st.cache_resource(show_spinner="Connecting to Google Sheets...")
 def get_worksheets():
     """Connect once, create any missing worksheet tabs and their header rows."""
-    creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]), scopes=SCOPES
-    )
-    sh = gspread.authorize(creds).open_by_key(st.secrets["sheet_id"])
+    sh = get_spreadsheet()
     # Google Sheets tab names are case-insensitive, so match that way
     existing = {ws.title.strip().lower(): ws for ws in sh.worksheets()}
 
@@ -335,86 +342,74 @@ def month_picker(label, key):
 
 def get_items():
     df = read_table("Items")
-    return df[df["active"] == 1][["id", "item_name", "size"]].sort_values(["item_name", "size"])
+    return df[df["active"] == 1][["id", "item_code", "item_name", "size", "category"]] \
+        .sort_values(["category", "item_name", "size"])
 
 
 def items_lookup():
     """Items renamed so 'id' becomes 'item_id' (for merging with Stock / Purchases)."""
     df = read_table("Items")
-    return df.rename(columns={"id": "item_id"})[["item_id", "item_name", "size", "active"]]
+    return df.rename(columns={"id": "item_id"})[
+        ["item_id", "item_code", "item_name", "size", "category", "active"]]
 
 
-def pick_item(pool, key):
-    """Two-step selector: Item, then Size / Variety. Returns (item_id, item_name, size)."""
-    names = sorted(pool["item_name"].unique())
-    c1, c2 = st.columns(2)
-    with c1:
-        name = st.selectbox("Item", names, key=f"{key}_name")
-    sizes = pool[pool["item_name"] == name].sort_values("size")
-    lookup = dict(zip(sizes["id"], sizes["size"]))
-    with c2:
-        item_id = st.selectbox(
-            "Size / Variety", list(lookup.keys()),
-            format_func=lambda x: size_label(lookup[x]), key=f"{key}_size_{name}"
-        )
-    return item_id, name, lookup[item_id]
-
-
-def item_exists(name, size):
+def category_list():
     df = read_table("Items")
-    hit = df[(df["item_name"].str.lower() == name.strip().lower()) &
-             (df["size"].str.lower() == size.strip().lower())]
-    return hit
+    return sorted(c for c in df["category"].astype(str).str.strip().unique() if c)
 
 
 def add_item_ui(key):
-    """Add an item and its sizes / varieties in one go, using a table.
-    Sizes are OPTIONAL: leave the table empty for an item that has no size / variety."""
+    """Add an item with a Main Category and one Item Code per size / variety."""
     ver_key = f"{key}_ver"
     st.session_state.setdefault(ver_key, 0)
+    cats = category_list()
 
     with st.form(f"{key}_form", clear_on_submit=True):
-        name = st.text_input("Item name *", placeholder="Water")
-        st.caption("List its sizes / varieties below. Click the empty bottom row to add more rows. "
-                   "**Leave the table empty if this item has no size / variety.**")
-        sizes_df = st.data_editor(
-            pd.DataFrame({"Size / Variety": ["", "", ""]}),
+        a, b, c = st.columns([2, 1.5, 1.5])
+        name = a.text_input("Item name *", placeholder="Water")
+        cat_sel = b.selectbox("Main category", ["(choose)"] + cats)
+        cat_new = c.text_input("...or new category", placeholder="Beverages")
+        st.caption("One row per size / variety, each with its own Item Code. "
+                   "For an item with no size, fill only the code. "
+                   "Click the empty bottom row to add more rows.")
+        rows_df = st.data_editor(
+            pd.DataFrame({"Item Code": ["", "", ""], "Size / Variety": ["", "", ""]}),
             num_rows="dynamic", hide_index=True, use_container_width=True,
             key=f"{key}_sizes_{st.session_state[ver_key]}",
         )
-        submitted = st.form_submit_button("Save Item & Sizes", type="primary")
+        submitted = st.form_submit_button("Save Item", type="primary")
 
     if submitted:
-        sizes, seen = [], set()
-        for s in sizes_df["Size / Variety"].fillna("").astype(str):
-            s = s.strip()
-            if s and s.lower() not in seen:
-                seen.add(s.lower())
-                sizes.append(s)
+        category = cat_new.strip() or ("" if cat_sel == "(choose)" else cat_sel)
+        rows = []
+        for _, r in rows_df.fillna("").astype(str).iterrows():
+            code, size = r["Item Code"].strip(), r["Size / Variety"].strip()
+            if code or size:
+                rows.append((code, size))
+        codes = [c for c, _ in rows]
+        taken = set(read_table("Items")["item_code"].str.strip().str.lower())
 
         if not name.strip():
             st.error("Item name is required.")
+        elif not category:
+            st.error("Choose or type a main category.")
+        elif not rows:
+            st.error("Enter at least one Item Code.")
+        elif any(not c for c in codes):
+            st.error("Every row needs an Item Code.")
+        elif len({c.lower() for c in codes}) != len(codes):
+            st.error("The same Item Code is used twice.")
+        elif any(c.lower() in taken for c in codes):
+            st.error("These Item Codes already exist: " +
+                     ", ".join(c for c in codes if c.lower() in taken))
         else:
-            if not sizes:
-                sizes = [""]  # item without any size / variety
-            items_df = read_table("Items")
-            taken = set(
-                items_df.loc[items_df["item_name"].str.lower() == name.strip().lower(), "size"]
-                .str.strip().str.lower()
-            )
-            to_add = [s for s in sizes if s.lower() not in taken]
-            skipped = [s for s in sizes if s.lower() in taken]
-
-            if to_add:
-                add_rows("Items", [
-                    {"id": new_id("I"), "item_name": name.strip(), "size": s, "active": 1}
-                    for s in to_add
-                ])
-                st.session_state[ver_key] += 1
-                st.success(f"Added {name.strip()}: {', '.join(size_label(s) for s in to_add)}.")
-            if skipped:
-                st.warning(f"Already exist (skipped, may be inactive): "
-                           f"{', '.join(size_label(s) for s in skipped)}.")
+            add_rows("Items", [
+                {"id": new_id("I"), "item_code": c, "item_name": name.strip(),
+                 "size": s, "category": category, "active": 1}
+                for c, s in rows
+            ])
+            st.session_state[ver_key] += 1
+            st.success(f"Added {name.strip()} ({category}): {', '.join(codes)}.")
 
 
 def header(title, subtitle):
@@ -425,6 +420,130 @@ def header(title, subtitle):
 def normal_user_count():
     u = read_table("Users")
     return int(((u["role"] != "Admin") & (u["active"] == 1)).sum())
+
+
+# ------------------------- DATA IMPORT ----------------------
+MONTH_NUM = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+BLOCK_RE = re.compile(r"(opening stock|closing stock|purchases)\s*\(\s*([a-z]+)\s+(\d{4})\s*\)", re.I)
+
+
+def parse_num(v):
+    """'570kg' -> 570, '250g' -> 0.25, '(100pkt)1860' -> 1860, '-' -> None. Returns (number, note)."""
+    s = str(v).strip().replace(",", "")
+    if s in ("", "-", "nan", "None"):
+        return None, ""
+    s = re.sub(r"\(.*?\)", "", s).strip()
+    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*([a-zA-Z]*)", s)
+    if not m:
+        return None, f"Could not read '{v}'"
+    num, unit = float(m.group(1)), m.group(2).lower()
+    if unit in ("", "kg", "l"):
+        return num, ""
+    if unit == "g":
+        val = num / 1000 if num >= 10 else num
+        return val, f"'{v}' read as {val:g} kg"
+    return num, f"Unit '{unit}' ignored in '{v}'"
+
+
+def parse_import_tab():
+    """
+    Reads the Rest_Import tab.
+    Columns A-D : Item Code | Main Category | Item | Size
+    Row 1       : group headings, e.g. 'Opening Stock (April 2026)', 'Purchases (May 2026)'
+    Row 2       : Qty | Unit Price | Total under each group
+    Row 3 +     : data
+    """
+    values = get_spreadsheet().worksheet(IMPORT_TAB).get_all_values()
+    if len(values) < 3:
+        return {"error": f"The {IMPORT_TAB} tab needs 2 header rows and at least one data row."}
+    raw = pd.DataFrame(values).fillna("")
+
+    groups, last = [], ""
+    for v in raw.iloc[0]:
+        v = str(v).strip()
+        if v:
+            last = v
+        groups.append(last)
+    subs = [str(v).strip().lower() for v in raw.iloc[1]]
+
+    blocks = {}  # (kind, month_key) -> {"qty": col, "price": col, "total": col}
+    for i in range(4, raw.shape[1]):
+        m = BLOCK_RE.search(groups[i])
+        if not m or subs[i] not in ("qty", "unit price", "total"):
+            continue
+        month = MONTH_NUM.get(m.group(2).lower())
+        if not month:
+            continue
+        mk = f"{int(m.group(3))}-{month:02d}"
+        kind = m.group(1).lower().split()[0]  # opening / closing / purchases
+        blocks.setdefault((kind, mk), {})[{"qty": "qty", "unit price": "price", "total": "total"}[subs[i]]] = i
+    if not blocks:
+        return {"error": "No headings like 'Opening Stock (April 2026)' were found in row 1."}
+
+    items, stock, purch, issues = {}, {}, [], []
+    for _, r in raw.iloc[2:].iterrows():
+        code, cat, name, size = [str(r[i]).strip() for i in range(4)]
+        if not code:
+            continue
+        items[code] = {"category": cat, "name": name, "size": size}
+        label = f"{name} {size}".strip()
+        for (kind, mk), cols in blocks.items():
+            qty, n1 = parse_num(r[cols["qty"]]) if "qty" in cols else (None, "")
+            price, n2 = parse_num(r[cols["price"]]) if "price" in cols else (None, "")
+            total, _ = parse_num(r[cols["total"]]) if "total" in cols else (None, "")
+            for n in (n1, n2):
+                if n:
+                    issues.append({"Code": code, "Item": label,
+                                   "Column": f"{kind.title()} {mk}", "Problem": n})
+            if qty is None:
+                continue
+            price = price or 0.0
+            if total is not None and abs(qty * price - total) > max(1.0, 0.02 * abs(total)):
+                issues.append({"Code": code, "Item": label, "Column": f"{kind.title()} {mk}",
+                               "Problem": f"Qty x Price = {qty * price:,.2f} but Total says {total:,.2f}"})
+            if kind == "purchases":
+                if qty > 0:
+                    purch.append({"code": code, "month_key": mk, "quantity": qty, "unit_price": price})
+            else:
+                # Opening stock of a month = closing stock of the previous month
+                smk = previous_month(mk) if kind == "opening" else mk
+                stock[(smk, code)] = {"quantity": qty, "unit_price": price}
+    return {"items": items, "stock": stock, "purchases": purch, "issues": issues}
+
+
+def run_import(imp, username):
+    items_df = read_table("Items")
+    code_to_id = dict(zip(items_df["item_code"].str.strip(), items_df["id"]))
+    new_items = []
+    for code, it in imp["items"].items():
+        if code not in code_to_id:
+            code_to_id[code] = new_id("I")
+            new_items.append({"id": code_to_id[code], "item_code": code, "item_name": it["name"],
+                              "size": it["size"], "category": it["category"], "active": 1})
+    add_rows("Items", new_items)
+
+    by_month = {}
+    for (mk, code), v in imp["stock"].items():
+        by_month.setdefault(mk, []).append({
+            "item_id": code_to_id[code], "quantity": v["quantity"],
+            "unit_price": v["unit_price"], "description": "Imported"})
+    for mk, rows in sorted(by_month.items()):
+        save_stock_batch(mk, rows, username)
+
+    pdf = read_table("Purchases")
+    imported = pdf[pdf["description"] == "Imported"]
+    done = set(zip(imported["month_key"], imported["item_id"]))
+    now, new_p = datetime.now().isoformat(), []
+    for p in imp["purchases"]:
+        iid = code_to_id[p["code"]]
+        if (p["month_key"], iid) in done:
+            continue  # already imported once
+        new_p.append({
+            "id": new_id("P"), "month_key": p["month_key"], "purchase_date": p["month_key"] + "-01",
+            "item_id": iid, "quantity": p["quantity"], "unit_price": p["unit_price"],
+            "description": "Imported", "entered_by": username, "created_at": now})
+    add_rows("Purchases", new_p)
+    return len(new_items), len(imp["stock"]), len(new_p)
 
 
 # ------------------------- AUTHENTICATION -------------------
@@ -570,8 +689,13 @@ if page == "Stock Entry":
         prev = previous_month(sk)
         stock_all = read_table("Stock")
 
+        sel_cat = st.selectbox("Main category", ["All categories"] + sorted(items["category"].unique()),
+                               key="stock_cat_sel")
+        if sel_cat != "All categories":
+            items = items[items["category"] == sel_cat]
+
         item_names = ["All items"] + sorted(items["item_name"].unique().tolist())
-        sel_item = st.selectbox("Item", item_names, key="stock_item_sel")
+        sel_item = st.selectbox("Item", item_names, key=f"stock_item_sel_{sel_cat}")
 
         pool = items if sel_item == "All items" else items[items["item_name"] == sel_item]
         pool = pool.rename(columns={"id": "item_id"})
@@ -587,6 +711,7 @@ if page == "Stock Entry":
 
         editor_df = pd.DataFrame({
             "item_id": base["item_id"].values,
+            "Code": base["item_code"].values,
             "Item": base["item_name"].values,
             "Size / Variety": [("" if str(s).strip() == "" else s) for s in base["size"].values],
             "Quantity": base["quantity"].values,
@@ -604,7 +729,7 @@ if page == "Stock Entry":
                 hide_index=True,
                 use_container_width=True,
                 num_rows="fixed",
-                disabled=["Item", "Size / Variety"],
+                disabled=["Code", "Item", "Size / Variety"],
                 column_config={
                     "item_id": None,
                     "Quantity": st.column_config.NumberColumn(
@@ -613,7 +738,7 @@ if page == "Stock Entry":
                     "Unit Price": st.column_config.NumberColumn("Unit Price (Rs.)", min_value=0.0, format="%.2f"),
                     "Description": st.column_config.TextColumn("Description"),
                 },
-                key=f"stock_editor_{sk}_{sel_item}_{st.session_state['stock_ver']}",
+                key=f"stock_editor_{sk}_{sel_cat}_{sel_item}_{st.session_state['stock_ver']}",
             )
             save_clicked = st.form_submit_button("Save Stock", type="primary")
 
@@ -642,13 +767,14 @@ if page == "Stock Entry":
     stock_all = read_table("Stock")
     entries = stock_all[stock_all["month_key"] == sk].merge(items_lookup(), on="item_id", how="left")
     entries["Stock Value"] = entries["quantity"] * entries["unit_price"]
-    entries = entries.sort_values(["item_name", "size"])
+    entries = entries.sort_values(["category", "item_name", "size"])
 
     if entries.empty:
         st.info("No stock entered for this month yet.")
     else:
-        table = entries[["item_name", "size", "quantity", "unit_price", "Stock Value",
-                         "description", "entered_by"]].rename(columns={
+        table = entries[["item_code", "category", "item_name", "size", "quantity", "unit_price",
+                         "Stock Value", "description", "entered_by"]].rename(columns={
+            "item_code": "Code", "category": "Main Category",
             "item_name": "Item", "size": "Size / Variety", "quantity": "Quantity",
             "unit_price": "Unit Price", "description": "Description", "entered_by": "Entered By",
         })
@@ -660,7 +786,8 @@ if page == "Stock Entry":
         )
 
         with st.expander("🗑️ Delete a stock entry"):
-            labels = {r["id"]: f'{r["item_name"]} - {size_label(r["size"])}' for _, r in entries.iterrows()}
+            labels = {r["id"]: f'{r["item_code"]} • {r["item_name"]} - {size_label(r["size"])}'
+                      for _, r in entries.iterrows()}
             del_id = st.selectbox("Entry", list(labels.keys()), format_func=lambda x: labels[x], key="del_stock")
             if st.button("Delete Entry", key="del_stock_btn"):
                 delete_row("Stock", del_id)
@@ -672,7 +799,7 @@ if page == "Stock Entry":
 # ============================================================
 elif page == "Purchases":
     header("Monthly Purchases",
-           "Record purchases made this month. Pick an item, then fill the table for its sizes / varieties.")
+           "Record purchases made this month. Pick a category and item, then fill the table for its sizes / varieties.")
 
     mk = month_picker("Purchase month", "purch")
     prev = previous_month(mk)
@@ -686,16 +813,21 @@ elif page == "Purchases":
     else:
         prev_stock = stock_all[stock_all["month_key"] == prev].merge(items_lookup(), on="item_id", how="left")
         prev_stock = prev_stock[prev_stock["active"] == 1]
-        pool = prev_stock[["item_id", "item_name", "size"]].rename(columns={"item_id": "id"}) \
-            .sort_values(["item_name", "size"])
+        pool = prev_stock[["item_id", "item_code", "item_name", "size", "category"]] \
+            .rename(columns={"item_id": "id"}).sort_values(["item_name", "size"])
 
     if pool.empty:
         st.warning(f"No stock was entered for {month_label(prev)}. Enter the opening stock of "
                    f"{month_label(mk)} (Stock Entry → Opening stock) or the closing stock of {month_label(prev)} first, "
                    "or tick the option above to show all items.")
     else:
+        sel_cat = st.selectbox("Main category", ["All categories"] + sorted(pool["category"].unique()),
+                               key="purch_cat")
+        if sel_cat != "All categories":
+            pool = pool[pool["category"] == sel_cat]
+
         names = sorted(pool["item_name"].unique())
-        item_name = st.selectbox("Item", names, key="purch_item")
+        item_name = st.selectbox("Item", names, key=f"purch_item_{sel_cat}")
 
         sizes_pool = pool[pool["item_name"] == item_name].sort_values("size")
         prev_prices = stock_all[stock_all["month_key"] == prev][["item_id", "unit_price"]] \
@@ -705,6 +837,7 @@ elif page == "Purchases":
         n_rows = len(sizes_pool)
         editor_df = pd.DataFrame({
             "id": sizes_pool["id"].values,
+            "Code": sizes_pool["item_code"].values,
             "Size / Variety": sizes_pool["size"].values,
             "Purchase Quantity": [float("nan")] * n_rows,
             "Unit Price (Rs.)": sizes_pool["prev_price"].astype(float).values,
@@ -727,7 +860,7 @@ elif page == "Purchases":
                 hide_index=True,
                 use_container_width=True,
                 num_rows="fixed",
-                disabled=["Size / Variety"],
+                disabled=["Code", "Size / Variety"],
                 column_config={
                     "id": None,
                     "Size / Variety": st.column_config.TextColumn("Size / Variety"),
@@ -737,7 +870,7 @@ elif page == "Purchases":
                         "Unit Price (Rs.)", min_value=0.0, format="%.2f"),
                     "Description": st.column_config.TextColumn("Description"),
                 },
-                key=f"purch_editor_{mk}_{item_name}_{show_all}_{st.session_state['purch_ver']}",
+                key=f"purch_editor_{mk}_{sel_cat}_{item_name}_{show_all}_{st.session_state['purch_ver']}",
             )
             save_clicked = st.form_submit_button("Save Purchase", type="primary")
 
@@ -771,9 +904,10 @@ elif page == "Purchases":
     if plist.empty:
         st.info("No purchases recorded for this month.")
     else:
-        table = plist[["purchase_date", "item_name", "size", "quantity", "unit_price", "Total",
-                       "description", "entered_by"]].rename(columns={
-            "purchase_date": "Date", "item_name": "Item", "size": "Size / Variety",
+        table = plist[["purchase_date", "item_code", "category", "item_name", "size", "quantity",
+                       "unit_price", "Total", "description", "entered_by"]].rename(columns={
+            "purchase_date": "Date", "item_code": "Code", "category": "Main Category",
+            "item_name": "Item", "size": "Size / Variety",
             "quantity": "Quantity", "unit_price": "Unit Price",
             "description": "Description", "entered_by": "Entered By",
         })
@@ -785,7 +919,7 @@ elif page == "Purchases":
         )
 
         with st.expander("🗑️ Delete a purchase"):
-            labels = {r["id"]: f'{r["purchase_date"]} • {r["item_name"]} - {size_label(r["size"])} • {r["quantity"]:g}'
+            labels = {r["id"]: f'{r["purchase_date"]} • {r["item_code"]} • {r["item_name"]} - {size_label(r["size"])} • {r["quantity"]:g}'
                       for _, r in plist.iterrows()}
             del_id = st.selectbox("Purchase", list(labels.keys()), format_func=lambda x: labels[x], key="del_purch")
             if st.button("Delete Purchase", key="del_purch_btn"):
@@ -808,7 +942,7 @@ elif page == "Sales Performance":
     purch_raw["purchase_value"] = purch_raw["quantity"] * purch_raw["unit_price"]
     purch = purch_raw.groupby(["month_key", "item_id"], as_index=False)[["quantity", "purchase_value"]].sum() \
         .rename(columns={"quantity": "purchase_qty"})
-    items_all = items_lookup()[["item_id", "item_name", "size"]]
+    items_all = items_lookup()[["item_id", "item_code", "item_name", "size", "category"]]
 
     if stock.empty:
         st.info("No stock has been entered yet.")
@@ -827,6 +961,7 @@ elif page == "Sales Performance":
         df["purchase_qty"] = df["purchase_qty"].fillna(0.0)
         df["purchase_value"] = df["purchase_value"].fillna(0.0)
         df = df.merge(items_all, on="item_id", how="left")
+        df["category"] = df["category"].fillna("")
 
         df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
         # Value-based: previous stock at ITS unit price + purchases at their prices - this month's stock at its price
@@ -839,10 +974,15 @@ elif page == "Sales Performance":
                     "(previous month and this month).")
         else:
             # ---- Filters ----
-            f1, f2, f3 = st.columns([1.3, 1.3, 1.4])
+            f0, f1, f2, f3 = st.columns([1.1, 1.3, 1.3, 1.4])
+            with f0:
+                sel_cat = st.selectbox("Main category", ["All categories"] +
+                                       sorted(df["category"].unique().tolist()), key="sales_cat")
+            if sel_cat != "All categories":
+                df = df[df["category"] == sel_cat]
             with f1:
                 names = ["All items"] + sorted(df["item_name"].dropna().unique().tolist())
-                sel_item = st.selectbox("Item", names, key="sales_item")
+                sel_item = st.selectbox("Item", names, key=f"sales_item_{sel_cat}")
             with f2:
                 if sel_item == "All items":
                     sel_size = st.selectbox("Size / Variety", ["All sizes"], disabled=True, key="sales_size_all")
@@ -888,6 +1028,8 @@ elif page == "Sales Performance":
 
                 title = "All items" if sel_item == "All items" else (
                     sel_item if sel_size == "All sizes" else f"{sel_item} - {size_label(sel_size)}")
+                if sel_cat != "All categories":
+                    title = f"{sel_cat} / {title}"
                 st.markdown(f'<div class="section-title">Monthly Sales: {title}</div>', unsafe_allow_html=True)
 
                 base_chart = alt.Chart(trend).encode(
@@ -910,12 +1052,13 @@ elif page == "Sales Performance":
                                "Check the stock or purchase entries for those items.")
 
                 st.markdown('<div class="section-title">Details</div>', unsafe_allow_html=True)
-                table = view.sort_values(["month_key", "item_name", "size"])[
-                    ["month_key", "item_name", "size", "opening_qty", "opening_price", "opening_value",
-                     "purchase_qty", "purchase_value", "closing_qty", "unit_price", "closing_value",
-                     "sold_qty", "sales_value"]
+                table = view.sort_values(["month_key", "category", "item_name", "size"])[
+                    ["month_key", "item_code", "category", "item_name", "size", "opening_qty", "opening_price",
+                     "opening_value", "purchase_qty", "purchase_value", "closing_qty", "unit_price",
+                     "closing_value", "sold_qty", "sales_value"]
                 ].rename(columns={
-                    "month_key": "Month", "item_name": "Item", "size": "Size / Variety",
+                    "month_key": "Month", "item_code": "Code", "category": "Main Category",
+                    "item_name": "Item", "size": "Size / Variety",
                     "opening_qty": "Previous Stock", "opening_price": "Previous Unit Price",
                     "opening_value": "Previous Stock Value",
                     "purchase_qty": "Purchases", "purchase_value": "Purchases Value",
@@ -942,9 +1085,9 @@ elif page == "Settings":
         st.error("Only an Admin can access Settings.")
         st.stop()
 
-    header("Settings", "Create user logins, manage items and change your password.")
+    header("Settings", "Create user logins, manage items, change your password and import previous data.")
 
-    tab1, tab2, tab3 = st.tabs(["👥 Users", "📦 Items", "🔑 My Password"])
+    tab1, tab2, tab3, tab4 = st.tabs(["👥 Users", "📦 Items", "🔑 My Password", "📥 Import Data"])
 
     # ---------------- USERS ----------------
     with tab1:
@@ -1025,16 +1168,17 @@ elif page == "Settings":
         st.markdown("### Item Master")
         add_item_ui("settings_add")
 
-        all_items = read_table("Items").sort_values(["item_name", "size"])
+        all_items = read_table("Items").sort_values(["category", "item_name", "size"])
         all_items["Status"] = all_items["active"].map({1: "Active", 0: "Inactive"})
         st.dataframe(
-            all_items[["item_name", "size", "Status"]].rename(
-                columns={"item_name": "Item", "size": "Size / Variety"}),
+            all_items[["item_code", "category", "item_name", "size", "Status"]].rename(
+                columns={"item_code": "Code", "category": "Main Category",
+                         "item_name": "Item", "size": "Size / Variety"}),
             use_container_width=True, hide_index=True
         )
 
         if not all_items.empty:
-            labels = {r["id"]: f'{r["item_name"]} - {size_label(r["size"])} ({r["Status"]})'
+            labels = {r["id"]: f'{r["item_code"]} • {r["item_name"]} - {size_label(r["size"])} ({r["Status"]})'
                       for _, r in all_items.iterrows()}
             sel_i = st.selectbox("Select item", list(labels.keys()), format_func=lambda x: labels[x], key="manage_item")
             is_active = int(all_items[all_items["id"] == sel_i].iloc[0]["active"]) == 1
@@ -1062,3 +1206,38 @@ elif page == "Settings":
             else:
                 update_row("Users", user["id"], {"password": hash_password(new)})
                 st.success("Password changed successfully.")
+
+    # ---------------- IMPORT DATA ----------------
+    with tab4:
+        st.markdown("### Import previous data")
+        st.caption(
+            f"Paste your sheet into a tab named **{IMPORT_TAB}** in the Google Sheet "
+            "(columns: Item Code | Main Category | Item | Size | then the month groups such as "
+            "'Opening Stock (April 2026)', 'Purchases (April 2026)', 'Closing Stock (April 2026)'; "
+            "row 2 = Qty / Unit Price / Total; data from row 3). Then read and check it here."
+        )
+        if st.button("🔍 Read & check Rest_Import"):
+            try:
+                st.session_state["imp"] = parse_import_tab()
+            except gspread.exceptions.WorksheetNotFound:
+                st.session_state.pop("imp", None)
+                st.error(f"Create a tab named exactly {IMPORT_TAB} in your Google Sheet first.")
+
+        imp = st.session_state.get("imp")
+        if imp and imp.get("error"):
+            st.error(imp["error"])
+        elif imp:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Items found", len(imp["items"]))
+            k2.metric("Stock records", len(imp["stock"]))
+            k3.metric("Purchase records", len(imp["purchases"]))
+            if imp["issues"]:
+                st.warning(f"{len(imp['issues'])} rows need a look. Fix them in {IMPORT_TAB} and read again, "
+                           "or import anyway (quantity × unit price is what gets saved).")
+                st.dataframe(pd.DataFrame(imp["issues"]), use_container_width=True, hide_index=True)
+            else:
+                st.success("All checks passed.")
+            if st.button("✅ Import now", type="primary"):
+                n_i, n_s, n_p = run_import(imp, user["username"])
+                st.session_state.pop("imp", None)
+                st.success(f"Imported {n_i} new items, {n_s} stock records and {n_p} purchases.")
