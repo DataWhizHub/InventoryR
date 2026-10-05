@@ -453,7 +453,8 @@ def parse_import_tab():
     Row 2       : Qty | Unit Price | Total under each group
     Row 3 +     : data
     """
-    values = get_spreadsheet().worksheet(IMPORT_TAB).get_all_values()
+    # UNFORMATTED_VALUE = real stored numbers (167.7), not the rounded text shown in the cell (168)
+    values = get_spreadsheet().worksheet(IMPORT_TAB).get_all_values(value_render_option="UNFORMATTED_VALUE")
     if len(values) < 3:
         return {"error": f"The {IMPORT_TAB} tab needs 2 header rows and at least one data row."}
     raw = pd.DataFrame(values).fillna("")
