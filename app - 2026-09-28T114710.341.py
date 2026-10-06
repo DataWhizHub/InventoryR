@@ -40,7 +40,7 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 html, body, [class*="css"] { font-family: Inter, sans-serif; }
-.stApp { background: #f3f6fa; }
+.stApp { background: #ffffff; }
 .block-container { padding-top: 2.4rem !important; padding-bottom: 2rem; max-width: 1500px; }
 
 section[data-testid="stSidebar"] { background: #172033 !important; border-right: 1px solid #26344d; }
@@ -84,7 +84,7 @@ footer { visibility: hidden; }
 /* ---- Force light look on the main page (device dark mode safe) ---- */
 :root { color-scheme: light only; }
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
-    background: #f3f6fa !important; color: #162033 !important;
+    background: #ffffff !important; color: #162033 !important;
 }
 [data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
 [data-testid="stMain"] [data-testid="stMarkdownContainer"] li,
@@ -117,32 +117,10 @@ div[data-baseweb="popover"] div[role="listbox"] {
     background: #2563eb !important; color: #ffffff !important; border: none !important;
 }
 [data-testid="stMain"] button[data-baseweb="tab"] { color: #162033 !important; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ------------------------- LIGHT / DARK MODE ----------------
-# Default is LIGHT. The sidebar button switches the main page to dark for this session.
-if "dark_mode" not in st.session_state:
-    st.session_state["dark_mode"] = False
-
-
-def toggle_theme():
-    st.session_state["dark_mode"] = not st.session_state["dark_mode"]
-
-
-if st.session_state["dark_mode"]:
-    st.markdown("""
-<style>
-.stApp { background: #0b1220 !important; }
-/* the whole main area is inverted, so tables, charts, inputs and text all go dark together */
-[data-testid="stMain"] { filter: invert(1) hue-rotate(180deg); }
-[data-testid="stMain"] img, [data-testid="stMain"] video { filter: invert(1) hue-rotate(180deg); }
-/* header arrow that re-opens the sidebar must stay visible on the dark background */
-[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
-[data-testid="collapsedControl"] { color: #eef4ff !important; }
-[data-testid="stExpandSidebarButton"] svg, [data-testid="stSidebarCollapsedControl"] svg,
-[data-testid="collapsedControl"] svg { fill: #eef4ff !important; color: #eef4ff !important; }
+/* tables and alerts: dark text on light background */
+[data-testid="stMain"] [data-testid="stDataFrame"],
+[data-testid="stMain"] [data-testid="stDataFrame"] * { color: #162033 !important; }
+[data-testid="stMain"] [data-testid="stAlert"] * { color: #162033 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -947,10 +925,6 @@ if is_admin:
 
 page = st.sidebar.radio("MENU", menu)
 st.sidebar.divider()
-st.sidebar.button(
-    "☀️ Light mode" if st.session_state["dark_mode"] else "🌙 Dark mode",
-    use_container_width=True, on_click=toggle_theme, key="theme_btn",
-)
 if st.sidebar.button("🔄 Refresh data", use_container_width=True):
     read_table.clear()
     st.rerun()
