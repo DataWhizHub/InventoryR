@@ -117,10 +117,17 @@ div[data-baseweb="popover"] div[role="listbox"] {
     background: #2563eb !important; color: #ffffff !important; border: none !important;
 }
 [data-testid="stMain"] button[data-baseweb="tab"] { color: #162033 !important; }
-/* tables and alerts: dark text on light background */
-[data-testid="stMain"] [data-testid="stDataFrame"],
-[data-testid="stMain"] [data-testid="stDataFrame"] * { color: #162033 !important; }
+/* alerts: dark text */
 [data-testid="stMain"] [data-testid="stAlert"] * { color: #162033 !important; }
+/* Tables / data editors are drawn on a canvas that follows the DEVICE theme (CSS cannot recolour it).
+   On a dark device the canvas is dark, so flip it: result = white background, dark text, blue stays blue. */
+@media (prefers-color-scheme: dark) {
+    [data-testid="stMain"] [data-testid="stDataFrame"],
+    [data-testid="stMain"] [data-testid="stDataEditor"] { filter: invert(1) hue-rotate(180deg); }
+    /* the small box that opens when you type inside a table cell */
+    #portal input, #portal textarea { background: #ffffff !important; color: #162033 !important; }
+    #portal .gdg-clip-region, #portal .gdg-clip-region > div { background: #ffffff !important; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1344,7 +1351,7 @@ elif page == "Sales Performance":
                     text=alt.Text("Value:Q", format=",.2f"),
                 )
                 chart = (line + labels).properties(height=400, padding={"top": 24, "right": 12, "left": 5, "bottom": 5})
-                st.altair_chart(chart, use_container_width=True)
+                st.altair_chart(chart, use_container_width=True, theme=None)
 
                 neg = view[view["sold_qty"] < 0]
                 if not neg.empty:
