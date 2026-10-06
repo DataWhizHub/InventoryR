@@ -138,8 +138,6 @@ if st.session_state["dark_mode"]:
 /* the whole main area is inverted, so tables, charts, inputs and text all go dark together */
 [data-testid="stMain"] { filter: invert(1) hue-rotate(180deg); }
 [data-testid="stMain"] img, [data-testid="stMain"] video { filter: invert(1) hue-rotate(180deg); }
-/* tables (st.dataframe / st.data_editor) stay in light mode: inverted a second time */
-[data-testid="stMain"] [data-testid="stDataFrame"] { filter: invert(1) hue-rotate(180deg); }
 /* header arrow that re-opens the sidebar must stay visible on the dark background */
 [data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
 [data-testid="collapsedControl"] { color: #eef4ff !important; }
