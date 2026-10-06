@@ -892,10 +892,17 @@ def login_page():
         st.markdown('<div class="login-caption">Monthly stock, purchases & sales performance</div>',
                     unsafe_allow_html=True)
 
-        username = st.text_input("Username", placeholder="Enter username")
-        password = st.text_input("Password", type="password", placeholder="Enter password")
+        with st.form("login_form", clear_on_submit=False):
+            try:
+                username = st.text_input("Username", placeholder="Enter username", autocomplete="username")
+                password = st.text_input("Password", type="password", placeholder="Enter password",
+                                         autocomplete="current-password")
+            except TypeError:  # older Streamlit without the autocomplete option
+                username = st.text_input("Username", placeholder="Enter username")
+                password = st.text_input("Password", type="password", placeholder="Enter password")
+            submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
 
-        if st.button("Sign In", type="primary", use_container_width=True):
+        if submitted:
             users = read_table("Users")
             hit = users[(users["username"] == username.strip()) & (users["active"] == 1)]
             if not hit.empty and verify_password(password, hit.iloc[0]["password"]):
@@ -1356,21 +1363,6 @@ elif page == "Sales Performance":
                     .configure_axis(labelColor="#162033", titleColor="#162033", domainColor="#94a3b8",
                                     tickColor="#94a3b8", gridColor="#e2e8f0")
                 st.altair_chart(chart, use_container_width=True, theme=None)
-
-                neg = view[view["sold_qty"] < 0]
-                if not neg.empty:
-                    st.warning(f"{len(neg)} row(s) have a negative quantity sold. "
-                               "Check the stock or purchase entries for these items.")
-                    neg_table = neg.sort_values(["month_key", "category", "item_name", "size"])[
-                        ["month_key", "item_code", "category", "item_name", "size",
-                         "opening_qty", "purchase_qty", "closing_qty", "sold_qty"]
-                    ].rename(columns={
-                        "month_key": "Month", "item_code": "Code", "category": "Main Category",
-                        "item_name": "Item", "size": "Size / Variety",
-                        "opening_qty": "Previous Stock", "purchase_qty": "Purchases",
-                        "closing_qty": "This Month Stock", "sold_qty": "Quantity Sold",
-                    })
-                    st.dataframe(neg_table, use_container_width=True, hide_index=True)
 
                 st.markdown('<div class="section-title">Details</div>', unsafe_allow_html=True)
                 table = view.sort_values(["month_key", "category", "item_name", "size"])[
