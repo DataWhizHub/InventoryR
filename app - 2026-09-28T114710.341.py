@@ -742,6 +742,7 @@ def create_import_tab():
 
 
 def run_import(imp, username):
+    """Returns (new items, stock records saved, new purchases, existing purchases that got their Total)."""
     items_df = read_table("Items")
     code_to_id = dict(zip(items_df["item_code"].str.strip(), items_df["id"]))
     new_items = []
@@ -782,7 +783,7 @@ def run_import(imp, username):
             "total_value": p.get("total")})
     add_rows("Purchases", new_p)
     set_purchase_totals(fill_totals)
-    return len(new_items), len(imp["stock"]), len(new_p)
+    return len(new_items), len(imp["stock"]), len(new_p), len(fill_totals)
 
 
 # ------------------------- AUTHENTICATION -------------------
@@ -1530,6 +1531,7 @@ elif page == "Settings":
             else:
                 st.success("All checks passed.")
             if st.button("✅ Import now", type="primary"):
-                n_i, n_s, n_p = run_import(imp, user["username"])
+                n_i, n_s, n_p, n_t = run_import(imp, user["username"])
                 st.session_state.pop("imp", None)
-                st.success(f"Imported {n_i} new items, {n_s} stock records and {n_p} purchases.")
+                st.success(f"Imported {n_i} new items, {n_s} stock records (new or updated with Totals), "
+                           f"{n_p} new purchases. Totals added to {n_t} existing purchases.")
