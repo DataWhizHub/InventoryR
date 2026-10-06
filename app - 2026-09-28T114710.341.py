@@ -80,6 +80,71 @@ header[data-testid="stHeader"] button, header[data-testid="stHeader"] a { pointe
 [data-testid="collapsedControl"] { display: flex !important; visibility: visible !important;
     pointer-events: auto !important; z-index: 999999; }
 footer { visibility: hidden; }
+
+/* ---- Force light look on the main page (device dark mode safe) ---- */
+:root { color-scheme: light only; }
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background: #f3f6fa !important; color: #162033 !important;
+}
+[data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stMain"] [data-testid="stMarkdownContainer"] li,
+[data-testid="stMain"] [data-testid="stWidgetLabel"] p,
+[data-testid="stMain"] [data-testid="stCaptionContainer"],
+[data-testid="stMain"] h1, [data-testid="stMain"] h2, [data-testid="stMain"] h3,
+[data-testid="stMain"] label, [data-testid="stMain"] summary {
+    color: #162033 !important;
+}
+[data-testid="stMain"] input, [data-testid="stMain"] textarea,
+[data-testid="stMain"] div[data-baseweb="input"] > div,
+[data-testid="stMain"] div[data-baseweb="select"] > div,
+[data-testid="stMain"] div[data-baseweb="base-input"] {
+    background: #ffffff !important; color: #162033 !important;
+}
+div[data-baseweb="popover"] ul, div[data-baseweb="popover"] li,
+div[data-baseweb="popover"] div[role="listbox"] {
+    background: #ffffff !important; color: #162033 !important;
+}
+[data-testid="stMain"] [data-testid="stExpander"] details {
+    background: #ffffff !important; border-color: #e1e7ef !important;
+}
+[data-testid="stMain"] button[kind="secondary"],
+[data-testid="stMain"] [data-testid="stFormSubmitButton"] button[kind="secondary"],
+[data-testid="stMain"] [data-testid="stDownloadButton"] button {
+    background: #ffffff !important; color: #162033 !important; border: 1px solid #cbd5e1 !important;
+}
+[data-testid="stMain"] button[kind="primary"],
+[data-testid="stMain"] button[kind="primaryFormSubmit"] {
+    background: #2563eb !important; color: #ffffff !important; border: none !important;
+}
+[data-testid="stMain"] button[data-baseweb="tab"] { color: #162033 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ------------------------- LIGHT / DARK MODE ----------------
+# Default is LIGHT. The sidebar button switches the main page to dark for this session.
+if "dark_mode" not in st.session_state:
+    st.session_state["dark_mode"] = False
+
+
+def toggle_theme():
+    st.session_state["dark_mode"] = not st.session_state["dark_mode"]
+
+
+if st.session_state["dark_mode"]:
+    st.markdown("""
+<style>
+.stApp { background: #0b1220 !important; }
+/* the whole main area is inverted, so tables, charts, inputs and text all go dark together */
+[data-testid="stMain"] { filter: invert(1) hue-rotate(180deg); }
+[data-testid="stMain"] img, [data-testid="stMain"] video { filter: invert(1) hue-rotate(180deg); }
+/* tables (st.dataframe / st.data_editor) stay in light mode: inverted a second time */
+[data-testid="stMain"] [data-testid="stDataFrame"] { filter: invert(1) hue-rotate(180deg); }
+/* header arrow that re-opens the sidebar must stay visible on the dark background */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"] { color: #eef4ff !important; }
+[data-testid="stExpandSidebarButton"] svg, [data-testid="stSidebarCollapsedControl"] svg,
+[data-testid="collapsedControl"] svg { fill: #eef4ff !important; color: #eef4ff !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -884,6 +949,10 @@ if is_admin:
 
 page = st.sidebar.radio("MENU", menu)
 st.sidebar.divider()
+st.sidebar.button(
+    "☀️ Light mode" if st.session_state["dark_mode"] else "🌙 Dark mode",
+    use_container_width=True, on_click=toggle_theme, key="theme_btn",
+)
 if st.sidebar.button("🔄 Refresh data", use_container_width=True):
     read_table.clear()
     st.rerun()
