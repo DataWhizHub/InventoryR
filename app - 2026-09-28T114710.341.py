@@ -26,7 +26,7 @@ from gspread.utils import rowcol_to_a1
 # ============================================================
 
 st.set_page_config(
-    page_title="Restaurant Inventory",
+    page_title="Kico Foods Family Restaurant",
     page_icon="🍽️",
     layout="wide",
     initial_sidebar_state="expanded",
