@@ -20,6 +20,9 @@ from gspread.utils import rowcol_to_a1
 #   Purchases         : purchases of the month (from previous month's stock items)
 #   Sales Performance : Sold = Previous month stock + Purchases - This month stock
 #   Settings          : users, items (code + main category), password, data import
+#
+#   Imported previous data keeps its own Total values (column total_value);
+#   those Totals are used for sales values instead of Quantity x Unit Price.
 # ============================================================
 
 st.set_page_config(
@@ -84,13 +87,14 @@ footer { visibility: hidden; }
 # ------------------------- GOOGLE SHEETS --------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# total_value (last column of Stock and Purchases) is filled ONLY for imported previous data.
 TABLES = {
     "Users": ["id", "username", "password", "full_name", "role", "active", "created_at"],
     "Items": ["id", "item_code", "item_name", "size", "category", "active"],
     "Stock": ["id", "month_key", "item_id", "quantity", "unit_price",
-              "description", "entered_by", "updated_at"],
+              "description", "entered_by", "updated_at", "total_value"],
     "Purchases": ["id", "month_key", "purchase_date", "item_id", "quantity", "unit_price",
-                  "description", "entered_by", "created_at"],
+                  "description", "entered_by", "created_at", "total_value"],
 }
 NUMERIC_COLS = ["quantity", "unit_price"]
 
@@ -121,10 +125,17 @@ def get_worksheets():
         ws = existing.get(title.lower())
         if ws is None:
             ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
-        first_row = ws.row_values(1)
+        first_row = [h.strip() for h in ws.row_values(1)]
         if not first_row:
             ws.append_row(headers, value_input_option="RAW")
-        elif [h.strip() for h in first_row[:len(headers)]] != headers:
+        elif first_row[:len(headers)] == headers:
+            pass
+        elif len(first_row) < len(headers) and first_row == headers[:len(first_row)]:
+            # older version of the tab (without the newest column(s)): extend the header row
+            if ws.col_count < len(headers):
+                ws.resize(cols=len(headers))
+            ws.update(range_name="A1", values=[headers], value_input_option="RAW")
+        else:
             raise ValueError(
                 f"The tab '{ws.title}' already exists but its header row does not match this app "
                 f"(expected: {', '.join(headers)}). Rename or delete that tab, or change TAB_PREFIX."
@@ -140,6 +151,8 @@ def _clean(v):
         return int(v)
     if hasattr(v, "item"):  # numpy scalar
         v = v.item()
+    if isinstance(v, float) and v != v:  # NaN -> empty cell
+        return ""
     return v
 
 
@@ -163,6 +176,10 @@ def _read_table_cached(name, version):
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    if "total_value" in df.columns:
+        # blank stays NaN = "no imported total, use quantity x unit price"
+        df["total_value"] = pd.to_numeric(
+            df["total_value"].astype(str).str.replace(",", "", regex=False), errors="coerce")
     if "active" in df.columns:
         df["active"] = pd.to_numeric(df["active"], errors="coerce").fillna(0).astype(int)
     return df
@@ -239,7 +256,8 @@ def add_rows(name, rows):
 def save_stock_batch(month_key, rows, entered_by):
     """
     Save many stock entries at once (max 3 API calls, however many rows).
-    rows: list of dicts with item_id, quantity, unit_price, description.
+    rows: list of dicts with item_id, quantity, unit_price, description and optional total_value
+          (total_value is only given for imported data; otherwise it is cleared).
     Existing (month, item) rows are updated, the rest are appended.
     """
     ws = get_worksheets()["Stock"]
@@ -253,18 +271,20 @@ def save_stock_batch(month_key, rows, entered_by):
     updates, new_rows = [], []
     for r in rows:
         key = (month_key, r["item_id"])
+        tv = _clean(r.get("total_value"))
+        tv = float(tv) if tv != "" else ""
         if key in sheet_row:
             n = sheet_row[key]
-            # columns D..H = quantity, unit_price, description, entered_by, updated_at
+            # columns D..I = quantity, unit_price, description, entered_by, updated_at, total_value
             updates.append({
-                "range": f"D{n}:H{n}",
+                "range": f"D{n}:I{n}",
                 "values": [[float(r["quantity"]), float(r["unit_price"]),
-                            r["description"], entered_by, now]],
+                            r["description"], entered_by, now, tv]],
             })
         else:
             new_rows.append([
                 new_id("S"), month_key, r["item_id"], float(r["quantity"]),
-                float(r["unit_price"]), r["description"], entered_by, now,
+                float(r["unit_price"]), r["description"], entered_by, now, tv,
             ])
 
     if updates:
@@ -272,6 +292,22 @@ def save_stock_batch(month_key, rows, entered_by):
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW")
     read_table.clear("Stock")
+
+
+def set_purchase_totals(pairs):
+    """pairs: list of (purchase_id, total). Fills total_value for already imported purchases (1-2 API calls)."""
+    if not pairs:
+        return
+    ws = get_worksheets()["Purchases"]
+    ids = ws.col_values(1)
+    col = TABLES["Purchases"].index("total_value") + 1
+    batch = []
+    for pid, total in pairs:
+        if pid in ids:
+            batch.append({"range": rowcol_to_a1(ids.index(pid) + 1, col), "values": [[float(total)]]})
+    if batch:
+        ws.batch_update(batch, value_input_option="RAW")
+    read_table.clear("Purchases")
 
 
 # Connect now and show a friendly message if setup is incomplete
@@ -422,9 +458,12 @@ def normal_user_count():
     return int(((u["role"] != "Admin") & (u["active"] == 1)).sum())
 
 
-def build_sales_report_pdf(rep, mk):
+def build_sales_report_pdf(rep, mk, prev_rep=None):
     """
     Monthly Sales Report PDF (landscape A4) for month `mk`.
+    - Main-category-wise "Total" row after each category's items (sales value only)
+    - Grand total row shows total sales only (no total sold quantity)
+    - Last page: Main Category sales summary (previous month, this month, growth %)
     The rows are split into fixed-size pages by hand (header repeated on every page), so the
     tables never need reportlab's automatic table splitting.
     """
@@ -438,6 +477,8 @@ def build_sales_report_pdf(rep, mk):
     prev_name = calendar.month_name[int(previous_month(mk)[5:7])]
     ROWS_PER_PAGE = 20
 
+    rep = rep.copy()
+    rep["category"] = rep["category"].astype(str).str.strip()
     rep = rep.sort_values(["category", "item_name", "size"]).copy()
     rep["label"] = [str(n) if str(s).strip() == "" else f"{n} - {str(s).strip()}"
                     for n, s in zip(rep["item_name"], rep["size"])]
@@ -447,22 +488,28 @@ def build_sales_report_pdf(rep, mk):
         return f"{float(x):,.2f}"
 
     cell_style = ParagraphStyle("cell", fontName="Helvetica", fontSize=8.5, leading=10)
-    rows = []
-    for _, r in rep.iterrows():
-        rows.append([
-            str(r["category"]).strip(), Paragraph(str(r["label"]).replace("&", "&amp;").replace("<", "&lt;"), cell_style),
-            n2(r["opening_qty"]), n2(r["opening_price"]),
-            n2(r["purchase_qty"]), n2(r["purchase_price"]),
-            n2(r["closing_qty"]), n2(r["unit_price"]),
-            n2(r["sold_qty"]), n2(r["sales_value"]),
-        ])
-    total_sold, total_sales = n2(rep["sold_qty"].sum()), n2(rep["sales_value"].sum())
+
+    # entries: ("item", category, cells) or ("sub", category, cells)
+    entries = []
+    for cat, g in rep.groupby("category", sort=False):
+        for _, r in g.iterrows():
+            entries.append(("item", cat, [
+                cat, Paragraph(str(r["label"]).replace("&", "&amp;").replace("<", "&lt;"), cell_style),
+                n2(r["opening_qty"]), n2(r["opening_price"]),
+                n2(r["purchase_qty"]), n2(r["purchase_price"]),
+                n2(r["closing_qty"]), n2(r["unit_price"]),
+                n2(r["sold_qty"]), n2(r["sales_value"]),
+            ]))
+        entries.append(("sub", cat, [
+            f"Total - {cat}" if cat else "Total", "", "", "", "", "", "", "", "", n2(g["sales_value"].sum()),
+        ]))
+    total_sales = n2(rep["sales_value"].sum())
 
     widths = [90, 170, 52, 52, 52, 52, 52, 52, 70, 90]
     title_style = ParagraphStyle("t", parent=getSampleStyleSheet()["Heading2"], alignment=1)
     title = f"Monthly Sales Report - {cur_name} {mk[:4]}"
 
-    chunks = [rows[i:i + ROWS_PER_PAGE] for i in range(0, len(rows), ROWS_PER_PAGE)] or [[]]
+    chunks = [entries[i:i + ROWS_PER_PAGE] for i in range(0, len(entries), ROWS_PER_PAGE)] or [[]]
     story = []
     for ci, chunk in enumerate(chunks):
         is_last = ci == len(chunks) - 1
@@ -475,24 +522,31 @@ def build_sales_report_pdf(rep, mk):
         spans = [("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (3, 0)),
                  ("SPAN", (4, 0), (5, 0)), ("SPAN", (6, 0), (7, 0)), ("SPAN", (8, 0), (9, 0))]
 
-        # category shown once per group of rows (merged cell)
-        start = 2
-        for i, row in enumerate(chunk):
+        # category shown once per group of item rows (merged cell); category total row spans A-H
+        start, cur, sub_rows = None, None, []
+        for i, (kind, cat, cells) in enumerate(chunk):
             r_no = 2 + i
-            if i > 0 and row[0] != chunk[i - 1][0]:
-                if r_no - 1 > start:
+            if kind == "item":
+                if cur != cat:
+                    if start is not None and r_no - 1 > start:
+                        spans.append(("SPAN", (0, start), (0, r_no - 1)))
+                    start, cur = r_no, cat
+            else:
+                if start is not None and r_no - 1 > start:
                     spans.append(("SPAN", (0, start), (0, r_no - 1)))
-                start = r_no
-            data.append(row)
+                start, cur = None, None
+                spans.append(("SPAN", (0, r_no), (7, r_no)))
+                sub_rows.append(r_no)
+            data.append(cells)
         last_data_row = 1 + len(chunk)
-        if len(chunk) > 0 and last_data_row > start:
+        if start is not None and last_data_row > start:
             spans.append(("SPAN", (0, start), (0, last_data_row)))
 
         total_row = None
         if is_last:
             total_row = len(data)
-            data.append(["Total", "", "", "", "", "", "", "", total_sold, total_sales])
-            spans.append(("SPAN", (0, total_row), (7, total_row)))
+            data.append(["Total", "", "", "", "", "", "", "", "", total_sales])
+            spans.append(("SPAN", (0, total_row), (8, total_row)))
 
         style = [
             ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
@@ -506,17 +560,66 @@ def build_sales_report_pdf(rep, mk):
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]
+        for r_no in sub_rows:
+            style += [("FONTNAME", (0, r_no), (-1, r_no), "Helvetica-Bold"),
+                      ("BACKGROUND", (0, r_no), (-1, r_no), colors.HexColor("#f1f5fb")),
+                      ("ALIGN", (0, r_no), (7, r_no), "RIGHT")]
         if total_row is not None:
             style += [("FONTNAME", (0, total_row), (-1, total_row), "Helvetica-Bold"),
-                      ("ALIGN", (0, total_row), (7, total_row), "RIGHT")]
+                      ("BACKGROUND", (0, total_row), (-1, total_row), colors.HexColor("#e8eef7")),
+                      ("ALIGN", (0, total_row), (8, total_row), "RIGHT")]
         table = Table(data, colWidths=widths)
         table.setStyle(TableStyle(style + spans))
 
         page = [Paragraph(title + ("" if ci == 0 else " (continued)"), title_style), Spacer(1, 8), table]
         # shrink-to-fit safety net: a page can never overflow, so no layout error is possible
         story.append(KeepInFrame(786, 500, page, mode="shrink"))
-        if not is_last:
-            story.append(PageBreak())
+        story.append(PageBreak())
+
+    # ---- Main Category sales summary (last page) ----
+    cur_by_cat = rep.groupby("category")["sales_value"].sum()
+    if prev_rep is not None and len(prev_rep) > 0:
+        pr = prev_rep.copy()
+        pr["category"] = pr["category"].astype(str).str.strip()
+        prev_by_cat = pr.groupby("category")["sales_value"].sum()
+    else:
+        prev_by_cat = pd.Series(dtype=float)
+
+    cats = sorted(set(cur_by_cat.index) | set(prev_by_cat.index))
+    cur_year = int(mk[:4])
+    prev_year = int(previous_month(mk)[:4])
+    sum_data = [["Main Category", f"{prev_name} {prev_year} Sales", f"{cur_name} {cur_year} Sales",
+                 "Sales Growth %"]]
+
+    def growth(cur_v, prev_v):
+        if not prev_v:
+            return "N/A"
+        return f"{(cur_v - prev_v) / abs(prev_v) * 100:+,.2f}%"
+
+    for c in cats:
+        pv, cv = float(prev_by_cat.get(c, 0.0)), float(cur_by_cat.get(c, 0.0))
+        sum_data.append([c or "(No category)", n2(pv), n2(cv), growth(cv, pv)])
+    tp, tc = float(prev_by_cat.sum()), float(cur_by_cat.sum())
+    sum_data.append(["Total", n2(tp), n2(tc), growth(tc, tp)])
+
+    last_r = len(sum_data) - 1
+    sum_table = Table(sum_data, colWidths=[200, 150, 150, 120])
+    sum_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, last_r), (-1, last_r), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef7")),
+        ("BACKGROUND", (0, last_r), (-1, last_r), colors.HexColor("#e8eef7")),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(Paragraph(f"Main Category Sales Summary - {cur_name} {cur_year}", title_style))
+    story.append(Spacer(1, 8))
+    story.append(sum_table)
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=28, rightMargin=28,
@@ -555,6 +658,7 @@ def parse_import_tab():
     Row 1       : group headings, e.g. 'Opening Stock (April 2026)', 'Purchases (May 2026)'
     Row 2       : Qty | Unit Price | Total under each group
     Row 3 +     : data
+    The Total of each group is kept and later used for sales calculations.
     """
     # UNFORMATTED_VALUE = real stored numbers (167.7), not the rounded text shown in the cell (168)
     values = get_spreadsheet().worksheet(IMPORT_TAB).get_all_values(value_render_option="UNFORMATTED_VALUE")
@@ -607,11 +711,12 @@ def parse_import_tab():
                                "Problem": f"Qty x Price = {qty * price:,.2f} but Total says {total:,.2f}"})
             if kind == "purchases":
                 if qty > 0:
-                    purch.append({"code": code, "month_key": mk, "quantity": qty, "unit_price": price})
+                    purch.append({"code": code, "month_key": mk, "quantity": qty,
+                                  "unit_price": price, "total": total})
             else:
                 # Opening stock of a month = closing stock of the previous month
                 smk = previous_month(mk) if kind == "opening" else mk
-                stock[(smk, code)] = {"quantity": qty, "unit_price": price}
+                stock[(smk, code)] = {"quantity": qty, "unit_price": price, "total": total}
     return {"items": items, "stock": stock, "purchases": purch, "issues": issues}
 
 
@@ -651,23 +756,32 @@ def run_import(imp, username):
     for (mk, code), v in imp["stock"].items():
         by_month.setdefault(mk, []).append({
             "item_id": code_to_id[code], "quantity": v["quantity"],
-            "unit_price": v["unit_price"], "description": "Imported"})
+            "unit_price": v["unit_price"], "description": "Imported",
+            "total_value": v.get("total")})  # imported Total is kept for sales calculations
     for mk, rows in sorted(by_month.items()):
         save_stock_batch(mk, rows, username)
 
+    read_table.clear("Purchases")
     pdf = read_table("Purchases")
     imported = pdf[pdf["description"] == "Imported"]
-    done = set(zip(imported["month_key"], imported["item_id"]))
-    now, new_p = datetime.now().isoformat(), []
+    done = {(m, i): (pid, tv) for m, i, pid, tv in
+            zip(imported["month_key"], imported["item_id"], imported["id"], imported["total_value"])}
+    now, new_p, fill_totals = datetime.now().isoformat(), [], []
     for p in imp["purchases"]:
         iid = code_to_id[p["code"]]
         if (p["month_key"], iid) in done:
-            continue  # already imported once
+            # already imported once: only fill in the Total if it is still missing
+            pid, tv = done[(p["month_key"], iid)]
+            if p.get("total") is not None and pd.isna(tv):
+                fill_totals.append((pid, p["total"]))
+            continue
         new_p.append({
             "id": new_id("P"), "month_key": p["month_key"], "purchase_date": p["month_key"] + "-01",
             "item_id": iid, "quantity": p["quantity"], "unit_price": p["unit_price"],
-            "description": "Imported", "entered_by": username, "created_at": now})
+            "description": "Imported", "entered_by": username, "created_at": now,
+            "total_value": p.get("total")})
     add_rows("Purchases", new_p)
+    set_purchase_totals(fill_totals)
     return len(new_items), len(imp["stock"]), len(new_p)
 
 
@@ -825,7 +939,7 @@ if page == "Stock Entry":
         pool = items if sel_item == "All items" else items[items["item_name"] == sel_item]
         pool = pool.rename(columns={"id": "item_id"})
 
-        cur = stock_all[stock_all["month_key"] == sk][["item_id", "quantity", "unit_price", "description"]]
+        cur = stock_all[stock_all["month_key"] == sk][["item_id", "quantity", "unit_price", "description", "total_value"]]
         prv = stock_all[stock_all["month_key"] == prev][["item_id", "unit_price"]] \
             .rename(columns={"unit_price": "prev_price"})
 
@@ -868,15 +982,25 @@ if page == "Stock Entry":
             save_clicked = st.form_submit_button("Save Stock", type="primary")
 
         if save_clicked:
+            # imported rows keep their Total only while quantity and unit price are left unchanged
+            orig = {r.item_id: (float(r.quantity), float(r.unit_price), r.total_value)
+                    for r in cur.itertuples()}
             rows = []
             for _, r in edited.iterrows():
                 if pd.isna(r["Quantity"]):
                     continue
+                qty = float(r["Quantity"])
+                price = 0.0 if pd.isna(r["Unit Price"]) else float(r["Unit Price"])
+                keep_total = None
+                o = orig.get(r["item_id"])
+                if o is not None and pd.notna(o[2]) and abs(o[0] - qty) < 1e-9 and abs(o[1] - price) < 1e-9:
+                    keep_total = float(o[2])
                 rows.append({
                     "item_id": r["item_id"],
-                    "quantity": float(r["Quantity"]),
-                    "unit_price": 0.0 if pd.isna(r["Unit Price"]) else float(r["Unit Price"]),
+                    "quantity": qty,
+                    "unit_price": price,
                     "description": "" if pd.isna(r["Description"]) else str(r["Description"]).strip(),
+                    "total_value": keep_total,
                 })
             if not rows:
                 st.warning("Enter at least one quantity before saving.")
@@ -1059,12 +1183,14 @@ elif page == "Sales Performance":
     header("Sales Performance",
            "Quantity sold = Previous month stock + This month purchases − This month stock. "
            "Sales value = (Previous stock × its unit price) + (Purchases × their unit price) "
-           "− (This month stock × its unit price).")
+           "− (This month stock × its unit price). Imported previous data uses its own Total values.")
 
-    stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price"]] \
-        .rename(columns={"quantity": "closing_qty"})
+    stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price", "total_value"]] \
+        .rename(columns={"quantity": "closing_qty", "total_value": "closing_total"})
     purch_raw = read_table("Purchases").copy()
-    purch_raw["purchase_value"] = purch_raw["quantity"] * purch_raw["unit_price"]
+    # imported purchases use their own Total; all others use quantity x unit price
+    purch_raw["purchase_value"] = purch_raw["total_value"].where(
+        purch_raw["total_value"].notna(), purch_raw["quantity"] * purch_raw["unit_price"])
     purch = purch_raw.groupby(["month_key", "item_id"], as_index=False)[["quantity", "purchase_value"]].sum() \
         .rename(columns={"quantity": "purchase_qty"})
     items_all = items_lookup()[["item_id", "item_code", "item_name", "size", "category"]]
@@ -1073,8 +1199,9 @@ elif page == "Sales Performance":
         st.info("No stock has been entered yet.")
     else:
         stock["prev_key"] = stock["month_key"].map(previous_month)
-        prev_stock = stock[["month_key", "item_id", "closing_qty", "unit_price"]].rename(
-            columns={"month_key": "prev_key", "closing_qty": "opening_qty", "unit_price": "opening_price"}
+        prev_stock = stock[["month_key", "item_id", "closing_qty", "unit_price", "closing_total"]].rename(
+            columns={"month_key": "prev_key", "closing_qty": "opening_qty", "unit_price": "opening_price",
+                     "closing_total": "opening_total"}
         )
 
         df = stock.merge(prev_stock, on=["prev_key", "item_id"], how="left")
@@ -1089,9 +1216,12 @@ elif page == "Sales Performance":
         df["category"] = df["category"].fillna("")
 
         df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
-        # Value-based: previous stock at ITS unit price + purchases at their prices - this month's stock at its price
-        df["opening_value"] = df["opening_qty"] * df["opening_price"]
-        df["closing_value"] = df["closing_qty"] * df["unit_price"]
+        # Value-based: previous stock value + purchases value - this month's stock value.
+        # Stock rows with an imported Total use that Total; all other rows use quantity x unit price.
+        df["opening_value"] = df["opening_total"].where(
+            df["opening_total"].notna(), df["opening_qty"] * df["opening_price"])
+        df["closing_value"] = df["closing_total"].where(
+            df["closing_total"].notna(), df["closing_qty"] * df["unit_price"])
         df["sales_value"] = df["opening_value"] + df["purchase_value"] - df["closing_value"]
 
         if df.empty:
@@ -1219,8 +1349,9 @@ elif page == "Sales Performance":
             report_months = sorted(df_all["month_key"].unique().tolist(), reverse=True)
             rep_mk = st.selectbox("Report month", report_months, format_func=month_label, key="report_month")
             rep = df_all[df_all["month_key"] == rep_mk]
+            prev_rep = df_all[df_all["month_key"] == previous_month(rep_mk)]
             try:
-                pdf_bytes = build_sales_report_pdf(rep, rep_mk)
+                pdf_bytes = build_sales_report_pdf(rep, rep_mk, prev_rep)
                 st.download_button(
                     f"📄 Download Monthly Sales Report - {month_label(rep_mk)} (PDF)",
                     pdf_bytes, f"monthly_sales_report_{rep_mk}.pdf", "application/pdf",
@@ -1367,7 +1498,8 @@ elif page == "Settings":
             f"Paste your sheet into a tab named **{IMPORT_TAB}** in the Google Sheet "
             "(columns: Item Code | Main Category | Item | Size | then the month groups such as "
             "'Opening Stock (April 2026)', 'Purchases (April 2026)', 'Closing Stock (April 2026)'; "
-            "row 2 = Qty / Unit Price / Total; data from row 3). Then read and check it here."
+            "row 2 = Qty / Unit Price / Total; data from row 3). Then read and check it here. "
+            "The Total column of the imported data is used for sales calculations."
         )
         if st.button(f"➕ Create the {IMPORT_TAB} tab with headers"):
             if create_import_tab():
@@ -1393,7 +1525,7 @@ elif page == "Settings":
             k3.metric("Purchase records", len(imp["purchases"]))
             if imp["issues"]:
                 st.warning(f"{len(imp['issues'])} rows need a look. Fix them in {IMPORT_TAB} and read again, "
-                           "or import anyway (quantity × unit price is what gets saved).")
+                           "or import anyway (the Total column is what gets used for sales values).")
                 st.dataframe(pd.DataFrame(imp["issues"]), use_container_width=True, hide_index=True)
             else:
                 st.success("All checks passed.")
