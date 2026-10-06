@@ -1350,7 +1350,11 @@ elif page == "Sales Performance":
                 labels = base_chart.mark_text(dy=-14, fontSize=12, fontWeight="bold", color="#172033").encode(
                     text=alt.Text("Value:Q", format=",.2f"),
                 )
-                chart = (line + labels).properties(height=400, padding={"top": 24, "right": 12, "left": 5, "bottom": 5})
+                chart = (line + labels).properties(height=400, padding={"top": 24, "right": 12, "left": 5, "bottom": 5}) \
+                    .configure(background="#ffffff") \
+                    .configure_view(fill="#ffffff", strokeWidth=0) \
+                    .configure_axis(labelColor="#162033", titleColor="#162033", domainColor="#94a3b8",
+                                    tickColor="#94a3b8", gridColor="#e2e8f0")
                 st.altair_chart(chart, use_container_width=True, theme=None)
 
                 neg = view[view["sold_qty"] < 0]
