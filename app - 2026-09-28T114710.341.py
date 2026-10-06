@@ -869,7 +869,7 @@ if "user" not in st.session_state:
 user = st.session_state.user
 is_admin = user["role"] == "Admin"
 
-st.sidebar.markdown('<div class="sidebar-brand">🍽️ Restaurant</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="sidebar-brand">🍽️ Kico Foods Family Restaurant</div>', unsafe_allow_html=True)
 st.sidebar.markdown('<div class="sidebar-sub">Inventory & Sales Performance</div>', unsafe_allow_html=True)
 st.sidebar.markdown(f"""
 <div class="user-chip">
