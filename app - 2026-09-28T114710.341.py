@@ -508,7 +508,9 @@ def normal_user_count():
 def build_sales_report_pdf(rep, mk, prev_rep=None):
     """
     Monthly Sold Quantity Report PDF (landscape A4) for month `mk`.
-    - Only Sold Quantity is shown (no sales values)
+    - Only Sold Quantity and Cost of Sales are shown (no sales values)
+    - Cost of Sales = ((previous month end unit price + weighted average purchase unit price of the month) / 2)
+                      x Sold Quantity
     - Main-category-wise "Total" row after each category's items
     - Last page: Main Category sold quantity summary (previous month, this month, growth %)
     The rows are split into fixed-size pages by hand (header repeated on every page), so the
@@ -531,6 +533,24 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
                     for n, s in zip(rep["item_name"], rep["size"])]
     rep["purchase_price"] = [(v / q) if q else 0.0 for v, q in zip(rep["purchase_value"], rep["purchase_qty"])]
 
+    # ---- Cost of Sales ----
+    # Purchases can be made on several days at different unit prices, so the purchase price used here is
+    # the quantity-weighted average: total purchase value / total purchase quantity of that item in that month
+    # (the same value shown in the "Purchases Unit Price" column).
+
+    def _cost_of_sales(r):
+        # ((previous month end unit price + weighted average purchase unit price) / 2) x sold quantity
+        # If one of the two prices does not exist, only the existing price is used.
+        prices = []
+        if r["opening_price"] > 0:
+            prices.append(float(r["opening_price"]))
+        if r["purchase_qty"] > 0 and r["purchase_price"] > 0:
+            prices.append(float(r["purchase_price"]))
+        avg = sum(prices) / len(prices) if prices else 0.0
+        return avg * float(r["sold_qty"])
+
+    rep["cost_of_sales"] = rep.apply(_cost_of_sales, axis=1)
+
     def n2(x):
         return f"{float(x):,.2f}"
 
@@ -545,14 +565,16 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
                 n2(r["opening_qty"]), n2(r["opening_price"]),
                 n2(r["purchase_qty"]), n2(r["purchase_price"]),
                 n2(r["closing_qty"]), n2(r["unit_price"]),
-                n2(r["sold_qty"]),
+                n2(r["sold_qty"]), n2(r["cost_of_sales"]),
             ]))
         entries.append(("sub", cat, [
-            f"Total - {cat}" if cat else "Total", "", "", "", "", "", "", "", n2(g["sold_qty"].sum()),
+            f"Total - {cat}" if cat else "Total", "", "", "", "", "", "", "",
+            n2(g["sold_qty"].sum()), n2(g["cost_of_sales"].sum()),
         ]))
     total_sold = n2(rep["sold_qty"].sum())
+    total_cost = n2(rep["cost_of_sales"].sum())
 
-    widths = [100, 190, 58, 58, 58, 58, 58, 58, 90]
+    widths = [90, 170, 56, 56, 56, 56, 56, 56, 80, 90]
     title_style = ParagraphStyle("t", parent=getSampleStyleSheet()["Heading2"], alignment=1)
     title = f"Monthly Sold Quantity Report - {cur_name} {mk[:4]}"
 
@@ -562,11 +584,12 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
         is_last = ci == len(chunks) - 1
         data = [
             ["Main Category", "Item with Size/Variety", f"{prev_name} End Stock", "",
-             f"{cur_name} Purchases", "", f"{cur_name} End Stock", "", "Sold Quantity"],
-            ["", "", "Quantity", "Unit Price", "Quantity", "Unit Price", "Quantity", "Unit Price", ""],
+             f"{cur_name} Purchases", "", f"{cur_name} End Stock", "", "Sold Quantity", "Cost of Sales"],
+            ["", "", "Quantity", "Unit Price", "Quantity", "Unit Price", "Quantity", "Unit Price", "", ""],
         ]
         spans = [("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (3, 0)),
-                 ("SPAN", (4, 0), (5, 0)), ("SPAN", (6, 0), (7, 0)), ("SPAN", (8, 0), (8, 1))]
+                 ("SPAN", (4, 0), (5, 0)), ("SPAN", (6, 0), (7, 0)), ("SPAN", (8, 0), (8, 1)),
+                 ("SPAN", (9, 0), (9, 1))]
 
         # category shown once per group of item rows (merged cell); category total row spans A-H
         start, cur, sub_rows = None, None, []
@@ -591,7 +614,7 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
         total_row = None
         if is_last:
             total_row = len(data)
-            data.append(["Total", "", "", "", "", "", "", "", total_sold])
+            data.append(["Total", "", "", "", "", "", "", "", total_sold, total_cost])
             spans.append(("SPAN", (0, total_row), (7, total_row)))
 
         style = [
