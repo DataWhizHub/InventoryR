@@ -509,8 +509,8 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
     """
     Monthly Sold Quantity Report PDF (landscape A4) for month `mk`.
     - Only Sold Quantity and Cost of Sales are shown (no sales values)
-    - Cost of Sales = ((previous month end unit price + weighted average purchase unit price of the month) / 2)
-                      x Sold Quantity
+    - Cost of Sales = (weighted average price x Sold Quantity, where the weighted average price =
+                      (prev end qty x prev end price + purchase value) / (prev end qty + purchase qty)
     - Main-category-wise "Total" row after each category's items
     - Last page: Main Category sold quantity summary (previous month, this month, growth %)
     The rows are split into fixed-size pages by hand (header repeated on every page), so the
@@ -534,20 +534,20 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
     rep["purchase_price"] = [(v / q) if q else 0.0 for v, q in zip(rep["purchase_value"], rep["purchase_qty"])]
 
     # ---- Cost of Sales ----
-    # Purchases can be made on several days at different unit prices, so the purchase price used here is
-    # the quantity-weighted average: total purchase value / total purchase quantity of that item in that month
-    # (the same value shown in the "Purchases Unit Price" column).
+    # Quantity-weighted average of the previous month end stock and the month's purchases
+    # (purchases made on different days at different prices are already combined in purchase_value).
 
     def _cost_of_sales(r):
-        # ((previous month end unit price + weighted average purchase unit price) / 2) x sold quantity
-        # If one of the two prices does not exist, only the existing price is used.
-        prices = []
-        if r["opening_price"] > 0:
-            prices.append(float(r["opening_price"]))
-        if r["purchase_qty"] > 0 and r["purchase_price"] > 0:
-            prices.append(float(r["purchase_price"]))
-        avg = sum(prices) / len(prices) if prices else 0.0
-        return avg * float(r["sold_qty"])
+        # Weighted average price = (previous end qty x previous end price + total purchase value)
+        #                          / (previous end qty + purchase qty)
+        # Cost of Sales = weighted average price x sold quantity
+        open_qty = max(float(r["opening_qty"]), 0.0)
+        buy_qty = max(float(r["purchase_qty"]), 0.0)
+        total_qty = open_qty + buy_qty
+        if total_qty <= 0:
+            return 0.0
+        total_value = open_qty * float(r["opening_price"]) + float(r["purchase_value"])
+        return (total_value / total_qty) * float(r["sold_qty"])
 
     rep["cost_of_sales"] = rep.apply(_cost_of_sales, axis=1)
 
