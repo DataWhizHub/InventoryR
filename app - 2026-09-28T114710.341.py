@@ -1158,7 +1158,17 @@ elif page == "Purchases":
         sizes_pool = pool[pool["item_name"] == item_name].sort_values("size")
         prev_prices = stock_all[stock_all["month_key"] == prev][["item_id", "unit_price"]] \
             .rename(columns={"item_id": "id", "unit_price": "prev_price"})
-        sizes_pool = sizes_pool.merge(prev_prices, on="id", how="left")  # suggest last month's price
+        sizes_pool = sizes_pool.merge(prev_prices, on="id", how="left")  # fallback: last month's stock price
+
+        # Suggested Unit Price = the unit price of the LATEST purchase entered for that item
+        # (latest purchase date, then latest entry time). Only if the item has no purchase
+        # history yet, fall back to the previous month's stock unit price.
+        purch_hist = read_table("Purchases")
+        purch_hist = purch_hist[purch_hist["unit_price"] > 0].sort_values(["purchase_date", "created_at"])
+        latest_purch_price = purch_hist.groupby("item_id", as_index=False).tail(1)[["item_id", "unit_price"]] \
+            .rename(columns={"item_id": "id", "unit_price": "latest_price"})
+        sizes_pool = sizes_pool.merge(latest_purch_price, on="id", how="left")
+        sizes_pool["suggest_price"] = sizes_pool["latest_price"].fillna(sizes_pool["prev_price"])
 
         n_rows = len(sizes_pool)
         editor_df = pd.DataFrame({
@@ -1166,7 +1176,7 @@ elif page == "Purchases":
             "Code": sizes_pool["item_code"].values,
             "Size / Variety": sizes_pool["size"].values,
             "Purchase Quantity": [float("nan")] * n_rows,
-            "Unit Price (Rs.)": sizes_pool["prev_price"].astype(float).values,
+            "Unit Price (Rs.)": sizes_pool["suggest_price"].astype(float).values,
             "Description": [""] * n_rows,
         })
 
