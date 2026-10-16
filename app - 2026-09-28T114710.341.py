@@ -697,50 +697,6 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
     return buf.getvalue()
 
 
-def compute_sold_df():
-    """Same Sold Quantity calculation as the Sold Quantity page (previous stock + purchases - this
-    month stock), used to build the PDF from whatever is in the tables right now."""
-    stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price", "total_value"]] \
-        .rename(columns={"quantity": "closing_qty", "total_value": "closing_total"})
-    if stock.empty:
-        return pd.DataFrame()
-    purch_raw = read_table("Purchases").copy()
-    purch_raw["purchase_value"] = purch_raw["total_value"].where(
-        purch_raw["total_value"].notna(), purch_raw["quantity"] * purch_raw["unit_price"])
-    purch = purch_raw.groupby(["month_key", "item_id"], as_index=False)[["quantity", "purchase_value"]].sum() \
-        .rename(columns={"quantity": "purchase_qty"})
-    items_all = items_lookup()[["item_id", "item_code", "item_name", "size", "category"]]
-
-    stock["prev_key"] = stock["month_key"].map(previous_month)
-    prev_stock = stock[["month_key", "item_id", "closing_qty", "unit_price", "closing_total"]].rename(
-        columns={"month_key": "prev_key", "closing_qty": "opening_qty", "unit_price": "opening_price",
-                 "closing_total": "opening_total"}
-    )
-    df = stock.merge(prev_stock, on=["prev_key", "item_id"], how="left")
-    df = df[df["prev_key"].isin(set(stock["month_key"]))].copy()
-    df["opening_qty"] = df["opening_qty"].fillna(0.0)
-    df["opening_price"] = df["opening_price"].fillna(0.0)
-    df = df.merge(purch, on=["month_key", "item_id"], how="left")
-    df["purchase_qty"] = df["purchase_qty"].fillna(0.0)
-    df["purchase_value"] = df["purchase_value"].fillna(0.0)
-    df = df.merge(items_all, on="item_id", how="left")
-    df["category"] = df["category"].fillna("")
-    df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
-    return df
-
-
-def fresh_report_pdf(report_month):
-    """Re-reads the Google Sheet RIGHT NOW and builds the PDF for `report_month` from that data."""
-    read_table.clear()
-    df = compute_sold_df()
-    if df.empty:
-        rep, prev_rep = df, df
-    else:
-        rep = df[df["month_key"] == report_month]
-        prev_rep = df[df["month_key"] == previous_month(report_month)]
-    return build_sales_report_pdf(rep, report_month, prev_rep)
-
-
 # ------------------------- DATA IMPORT ----------------------
 MONTH_NUM = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 BLOCK_RE = re.compile(r"(opening stock|closing stock|purchases)\s*\(\s*([a-z]+)\s+(\d{4})\s*\)", re.I)
@@ -1003,13 +959,6 @@ if is_admin:
     menu.append("Settings")
 
 page = st.sidebar.radio("MENU", menu)
-
-# Data is cached for CACHE_SECONDS, so edits made directly in the Google Sheet would not show up
-# (e.g. in the Sold Quantity PDF). Re-read the sheet each time the Sold Quantity page is opened.
-if st.session_state.get("_last_page") != page and page == "Sold Quantity":
-    read_table.clear()
-st.session_state["_last_page"] = page
-
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh data", use_container_width=True):
     read_table.clear()
@@ -1321,10 +1270,6 @@ elif page == "Sold Quantity":
     header("Sold Quantity",
            "Quantity sold = Previous month stock + This month purchases − This month stock.")
 
-    if st.button("🔄 Reload latest data from Google Sheet", key="sold_reload"):
-        read_table.clear()
-        st.rerun()
-
     stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price", "total_value"]] \
         .rename(columns={"quantity": "closing_qty", "total_value": "closing_total"})
     purch_raw = read_table("Purchases").copy()
@@ -1464,25 +1409,14 @@ elif page == "Sold Quantity":
             rep = df_all[df_all["month_key"] == rep_mk]
             prev_rep = df_all[df_all["month_key"] == previous_month(rep_mk)]
             try:
-                import reportlab  # noqa: F401  (only checking that it is installed)
+                pdf_bytes = build_sales_report_pdf(rep, rep_mk, prev_rep)
+                st.download_button(
+                    f"📄 Download Monthly Sold Quantity Report - {month_label(rep_mk)} (PDF)",
+                    pdf_bytes, f"monthly_sold_quantity_report_{rep_mk}.pdf", "application/pdf",
+                    key="report_pdf_btn",
+                )
             except ImportError:
                 st.error("PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and reboot the app.")
-            else:
-                pdf_label = f"📄 Download Monthly Sold Quantity Report - {month_label(rep_mk)} (PDF)"
-                pdf_name = f"monthly_sold_quantity_report_{rep_mk}.pdf"
-                try:
-                    # The PDF is generated when the button is CLICKED (fresh data from Google Sheet).
-                    st.download_button(
-                        pdf_label, data=lambda: fresh_report_pdf(rep_mk),
-                        file_name=pdf_name, mime="application/pdf", key="report_pdf_btn",
-                    )
-                except Exception:
-                    # Older Streamlit versions cannot build the file on click, so the PDF is built
-                    # from a fresh read of the Google Sheet every time this page is drawn.
-                    st.download_button(
-                        pdf_label, fresh_report_pdf(rep_mk), pdf_name, "application/pdf",
-                        key="report_pdf_btn_fresh",
-                    )
 
 
 # ============================================================
