@@ -177,8 +177,13 @@ def get_spreadsheet():
     return gspread.authorize(creds).open_by_key(st.secrets["sheet_id"])
 
 
-@st.cache_resource(show_spinner="Connecting to Google Sheets...")
 def get_worksheets():
+    # the table list is part of the cache key, so adding a new table never needs a manual reboot
+    return _get_worksheets(tuple(TABLES))
+
+
+@st.cache_resource(show_spinner="Connecting to Google Sheets...")
+def _get_worksheets(table_names):
     """Connect once, create any missing worksheet tabs and their header rows."""
     sh = get_spreadsheet()
     # Google Sheets tab names are case-insensitive, so match that way
@@ -252,14 +257,14 @@ def _read_table_cached(name, version):
 
 
 def read_table(name):
-    return _read_table_cached(name, _table_versions()[name])
+    return _read_table_cached(name, _table_versions().setdefault(name, 0))
 
 
 def _clear_tables(name=None):
     """Refresh one table (name) or all tables (no argument)."""
     v = _table_versions()
-    for t in ([name] if name else list(v)):
-        v[t] += 1
+    for t in ([name] if name else list(TABLES)):
+        v[t] = v.get(t, 0) + 1
 
 
 read_table.clear = _clear_tables
