@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import secrets
 import calendar
+import html
 import io
 import re
 from datetime import date, datetime
@@ -19,6 +20,9 @@ from gspread.utils import rowcol_to_a1
 #   Stock Entry       : month-end stock (item, size, qty, unit price, description)
 #   Purchases         : purchases of the month (from previous month's stock items)
 #   Sold Quantity     : Sold = Previous month stock + Purchases - This month stock
+#   Other Expenses    : monthly expenses (Expense Type, Total Rs)
+#   Monthly Sales     : total sales (Rs) of the month
+#   Profit Report     : Profit = Total Sales - Total Cost of Sales - Other Expenses
 #   Settings          : users, items (code + main category), password, data import
 #
 #   Imported previous data keeps its own Total values (column total_value).
@@ -66,6 +70,18 @@ section[data-testid="stSidebar"] button:hover { background: #334766 !important; 
 .section-title { color: #172033; font-weight: 800; font-size: 1.08rem; margin: 22px 0 10px 0; }
 .login-logo { font-size: 2rem; font-weight: 800; color: #172033; }
 .login-caption { color: #718096; margin-bottom: 14px; }
+
+/* ---- Profit report table ---- */
+.pl-title { font-size: 1.25rem; font-weight: 800; color: #172033; margin: 6px 0 10px 0; }
+.pl-table { width: 100%; max-width: 640px; border-collapse: collapse; }
+.pl-table td { border: 1px solid #cbd5e1; padding: 9px 14px; color: #162033; background: #ffffff; }
+.pl-table td.amt { text-align: right; white-space: nowrap; }
+.pl-table tr.head td { background: #e8eef7; font-weight: 800; }
+.pl-table tr.sub td { color: #4b5a70; font-size: .92rem; background: #f8fafc; }
+.pl-table tr.sub td:first-child { padding-left: 34px; }
+.pl-table tr.profit td { background: #e8eef7; font-weight: 800; font-size: 1.08rem; }
+.pl-table tr.profit td.pos { color: #15803d; }
+.pl-table tr.profit td.neg { color: #dc2626; }
 
 div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea { border-radius: 8px !important; }
 [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
@@ -142,11 +158,13 @@ TABLES = {
               "description", "entered_by", "updated_at", "total_value"],
     "Purchases": ["id", "month_key", "purchase_date", "item_id", "quantity", "unit_price",
                   "description", "entered_by", "created_at", "total_value"],
+    "Expenses": ["id", "month_key", "expense_type", "amount", "entered_by", "updated_at"],
+    "Sales": ["id", "month_key", "total_sales", "entered_by", "updated_at"],
 }
-NUMERIC_COLS = ["quantity", "unit_price"]
+NUMERIC_COLS = ["quantity", "unit_price", "amount", "total_sales"]
 
-# Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases so they never
-# clash with tabs from your other apps if you reuse the same Google Sheet file.
+# Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases, Rest_Expenses, Rest_Sales
+# so they never clash with tabs from your other apps if you reuse the same Google Sheet file.
 TAB_PREFIX = "Rest_"
 IMPORT_TAB = "Rest_Import"  # paste your old data here, then import from Settings > Import Data
 
@@ -222,7 +240,8 @@ def _read_table_cached(name, version):
     df = pd.DataFrame(rows, columns=headers)
     for col in NUMERIC_COLS:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0.0)
     if "total_value" in df.columns:
         # blank stays NaN = "no imported total, use quantity x unit price"
         df["total_value"] = pd.to_numeric(
@@ -357,12 +376,48 @@ def set_purchase_totals(pairs):
     read_table.clear("Purchases")
 
 
+def save_expenses(month_key, rows, entered_by):
+    """
+    Replace ALL expense rows of one month with `rows` (list of dicts: expense_type, amount).
+    Rows of other months are kept untouched. Uses 2-3 API calls however many rows there are.
+    """
+    ws = get_worksheets()["Expenses"]
+    headers = TABLES["Expenses"]
+    # UNFORMATTED_VALUE keeps the real numbers of the other months (not rounded / comma text)
+    values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    keep = [(list(r) + [""] * len(headers))[:len(headers)]
+            for r in values[1:] if len(r) >= 2 and r[0] != "" and r[1] != month_key]
+    now = datetime.now().isoformat()
+    new = [[new_id("E"), month_key, r["expense_type"], float(r["amount"]), entered_by, now] for r in rows]
+    data = [headers] + keep + new
+    ws.update(range_name="A1", values=data, value_input_option="RAW")
+    if len(values) > len(data):  # old rows that are no longer needed at the bottom
+        ws.batch_clear([f"A{len(data) + 1}:{rowcol_to_a1(len(values), len(headers))}"])
+    read_table.clear("Expenses")
+
+
+def save_monthly_sales(month_key, total, entered_by):
+    """One Total Sales value per month: update it if the month exists, otherwise add a new row."""
+    ws = get_worksheets()["Sales"]
+    values = ws.get_all_values()
+    now = datetime.now().isoformat()
+    for i, r in enumerate(values[1:], start=2):
+        if len(r) >= 2 and r[0] != "" and r[1] == month_key:
+            # columns C..E = total_sales, entered_by, updated_at
+            ws.batch_update([{"range": f"C{i}:E{i}", "values": [[float(total), entered_by, now]]}],
+                            value_input_option="RAW")
+            break
+    else:
+        ws.append_row([new_id("M"), month_key, float(total), entered_by, now], value_input_option="RAW")
+    read_table.clear("Sales")
+
+
 # Connect now and show a friendly message if setup is incomplete
 try:
     get_worksheets()
 except KeyError as e:
-    st.error(f"Missing Streamlit secret: {e}. Add `sheet_id` and `[gcp_service_account]` "
-             "to .streamlit/secrets.toml (see the setup notes).")
+    st.error(f"Missing Streamlit secret or worksheet: {e}. Add `sheet_id` and `[gcp_service_account]` "
+             "to .streamlit/secrets.toml (see the setup notes). If you just updated the app, reboot it once.")
     st.stop()
 except gspread.exceptions.SpreadsheetNotFound:
     st.error("Spreadsheet not found. Check `sheet_id` and share the sheet with the service-account "
@@ -500,9 +555,79 @@ def header(title, subtitle):
     st.markdown(f'<div class="page-subtitle">{subtitle}</div>', unsafe_allow_html=True)
 
 
+def show_flash(key):
+    """Show (once) a success message stored before a st.rerun()."""
+    msg = st.session_state.pop(key, None)
+    if msg:
+        st.success(msg)
+
+
 def normal_user_count():
     u = read_table("Users")
     return int(((u["role"] != "Admin") & (u["active"] == 1)).sum())
+
+
+def add_cost_of_sales(df):
+    """
+    Adds the column 'cost_of_sales' to a Sold Quantity table.
+    Weighted average price = (previous end qty x previous end price + total purchase value)
+                             / (previous end qty + purchase qty)
+    Cost of Sales = weighted average price x sold quantity
+    """
+    df = df.copy()
+    out = []
+    for r in df.to_dict("records"):
+        open_qty = max(float(r["opening_qty"]), 0.0)
+        buy_qty = max(float(r["purchase_qty"]), 0.0)
+        total_qty = open_qty + buy_qty
+        if total_qty <= 0:
+            out.append(0.0)
+            continue
+        total_value = open_qty * float(r["opening_price"]) + float(r["purchase_value"])
+        out.append((total_value / total_qty) * float(r["sold_qty"]))
+    df["cost_of_sales"] = out
+    return df
+
+
+def compute_sold_data():
+    """
+    Sold quantity (and cost of sales) of every item and month, calculated from the stock and
+    purchases tables. Returns None when no stock exists yet, otherwise a DataFrame
+    (empty if there are not two consecutive months of stock).
+    """
+    stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price", "total_value"]] \
+        .rename(columns={"quantity": "closing_qty", "total_value": "closing_total"})
+    if stock.empty:
+        return None
+
+    purch_raw = read_table("Purchases").copy()
+    # imported purchases use their own Total; all others use quantity x unit price
+    # (the purchase unit price is still needed by the PDF report)
+    purch_raw["purchase_value"] = purch_raw["total_value"].where(
+        purch_raw["total_value"].notna(), purch_raw["quantity"] * purch_raw["unit_price"])
+    purch = purch_raw.groupby(["month_key", "item_id"], as_index=False)[["quantity", "purchase_value"]].sum() \
+        .rename(columns={"quantity": "purchase_qty"})
+    items_all = items_lookup()[["item_id", "item_code", "item_name", "size", "category"]]
+
+    stock["prev_key"] = stock["month_key"].map(previous_month)
+    prev_stock = stock[["month_key", "item_id", "closing_qty", "unit_price", "closing_total"]].rename(
+        columns={"month_key": "prev_key", "closing_qty": "opening_qty", "unit_price": "opening_price",
+                 "closing_total": "opening_total"}
+    )
+
+    df = stock.merge(prev_stock, on=["prev_key", "item_id"], how="left")
+    # Only months where the previous month's stock exists can be calculated
+    df = df[df["prev_key"].isin(set(stock["month_key"]))].copy()
+    df["opening_qty"] = df["opening_qty"].fillna(0.0)
+    df["opening_price"] = df["opening_price"].fillna(0.0)
+    df = df.merge(purch, on=["month_key", "item_id"], how="left")
+    df["purchase_qty"] = df["purchase_qty"].fillna(0.0)
+    df["purchase_value"] = df["purchase_value"].fillna(0.0)
+    df = df.merge(items_all, on="item_id", how="left")
+    df["category"] = df["category"].fillna("")
+
+    df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
+    return add_cost_of_sales(df)
 
 
 def build_sales_report_pdf(rep, mk, prev_rep=None):
@@ -533,23 +658,8 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
                     for n, s in zip(rep["item_name"], rep["size"])]
     rep["purchase_price"] = [(v / q) if q else 0.0 for v, q in zip(rep["purchase_value"], rep["purchase_qty"])]
 
-    # ---- Cost of Sales ----
-    # Quantity-weighted average of the previous month end stock and the month's purchases
-    # (purchases made on different days at different prices are already combined in purchase_value).
-
-    def _cost_of_sales(r):
-        # Weighted average price = (previous end qty x previous end price + total purchase value)
-        #                          / (previous end qty + purchase qty)
-        # Cost of Sales = weighted average price x sold quantity
-        open_qty = max(float(r["opening_qty"]), 0.0)
-        buy_qty = max(float(r["purchase_qty"]), 0.0)
-        total_qty = open_qty + buy_qty
-        if total_qty <= 0:
-            return 0.0
-        total_value = open_qty * float(r["opening_price"]) + float(r["purchase_value"])
-        return (total_value / total_qty) * float(r["sold_qty"])
-
-    rep["cost_of_sales"] = rep.apply(_cost_of_sales, axis=1)
+    # ---- Cost of Sales (same calculation as the Profit Report) ----
+    rep = add_cost_of_sales(rep)
 
     def n2(x):
         return f"{float(x):,.2f}"
@@ -694,6 +804,53 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
     doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=28, rightMargin=28,
                             topMargin=28, bottomMargin=28, title=title)
     doc.build(story)
+    return buf.getvalue()
+
+
+def build_profit_report_pdf(title, sales, cost, expenses, profit):
+    """
+    Profit Report PDF (portrait A4).
+    expenses: list of (expense_type, amount). Profit = Total Sales - Total Cost of Sales - Other Expenses.
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    def n2(x):
+        return f"{float(x):,.2f}"
+
+    other_total = sum(a for _, a in expenses)
+    data = [["Total Sales", n2(sales)],
+            ["Total Cost of Sales", n2(cost)],
+            ["Other Expenses", n2(other_total)]]
+    for t, a in expenses:
+        data.append([t, n2(a)])
+    data.append(["Profit", n2(profit)])
+    profit_row = len(data) - 1
+
+    style = [
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("FONTNAME", (0, 0), (-1, 2), "Helvetica-Bold"),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("BACKGROUND", (0, 0), (-1, 2), colors.HexColor("#e8eef7")),
+        ("LEFTPADDING", (0, 3), (0, profit_row - 1), 26),
+        ("TEXTCOLOR", (0, 3), (-1, profit_row - 1), colors.HexColor("#4b5a70")),
+        ("FONTNAME", (0, profit_row), (-1, profit_row), "Helvetica-Bold"),
+        ("FONTSIZE", (0, profit_row), (-1, profit_row), 11),
+        ("BACKGROUND", (0, profit_row), (-1, profit_row), colors.HexColor("#e8eef7")),
+    ]
+    table = Table(data, colWidths=[300, 150])
+    table.setStyle(TableStyle(style))
+
+    title_style = ParagraphStyle("pt", parent=getSampleStyleSheet()["Heading2"], alignment=1)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=60, rightMargin=60,
+                            topMargin=50, bottomMargin=50, title=title)
+    doc.build([Paragraph(html.escape(title), title_style), Spacer(1, 12), table])
     return buf.getvalue()
 
 
@@ -954,7 +1111,7 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-menu = ["Stock Entry", "Purchases", "Sold Quantity"]
+menu = ["Stock Entry", "Purchases", "Sold Quantity", "Other Expenses", "Monthly Sales", "Profit Report"]
 if is_admin:
     menu.append("Settings")
 
@@ -1270,39 +1427,11 @@ elif page == "Sold Quantity":
     header("Sold Quantity",
            "Quantity sold = Previous month stock + This month purchases − This month stock.")
 
-    stock = read_table("Stock")[["month_key", "item_id", "quantity", "unit_price", "total_value"]] \
-        .rename(columns={"quantity": "closing_qty", "total_value": "closing_total"})
-    purch_raw = read_table("Purchases").copy()
-    # imported purchases use their own Total; all others use quantity x unit price
-    # (the purchase unit price is still needed by the PDF report)
-    purch_raw["purchase_value"] = purch_raw["total_value"].where(
-        purch_raw["total_value"].notna(), purch_raw["quantity"] * purch_raw["unit_price"])
-    purch = purch_raw.groupby(["month_key", "item_id"], as_index=False)[["quantity", "purchase_value"]].sum() \
-        .rename(columns={"quantity": "purchase_qty"})
-    items_all = items_lookup()[["item_id", "item_code", "item_name", "size", "category"]]
+    df = compute_sold_data()
 
-    if stock.empty:
+    if df is None:
         st.info("No stock has been entered yet.")
     else:
-        stock["prev_key"] = stock["month_key"].map(previous_month)
-        prev_stock = stock[["month_key", "item_id", "closing_qty", "unit_price", "closing_total"]].rename(
-            columns={"month_key": "prev_key", "closing_qty": "opening_qty", "unit_price": "opening_price",
-                     "closing_total": "opening_total"}
-        )
-
-        df = stock.merge(prev_stock, on=["prev_key", "item_id"], how="left")
-        # Only months where the previous month's stock exists can be calculated
-        df = df[df["prev_key"].isin(set(stock["month_key"]))].copy()
-        df["opening_qty"] = df["opening_qty"].fillna(0.0)
-        df["opening_price"] = df["opening_price"].fillna(0.0)
-        df = df.merge(purch, on=["month_key", "item_id"], how="left")
-        df["purchase_qty"] = df["purchase_qty"].fillna(0.0)
-        df["purchase_value"] = df["purchase_value"].fillna(0.0)
-        df = df.merge(items_all, on="item_id", how="left")
-        df["category"] = df["category"].fillna("")
-
-        df["sold_qty"] = df["opening_qty"] + df["purchase_qty"] - df["closing_qty"]
-
         if df.empty:
             st.info("Sold quantity needs at least two consecutive months of stock entries "
                     "(previous month and this month).")
@@ -1417,6 +1546,203 @@ elif page == "Sold Quantity":
                 )
             except ImportError:
                 st.error("PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and reboot the app.")
+
+
+# ============================================================
+# OTHER EXPENSES  (monthly table: Expense Type + Total Rs)
+# ============================================================
+elif page == "Other Expenses":
+    header("Other Expenses",
+           "Enter the other expenses of the month (rent, salaries, electricity, ...). "
+           "They are deducted in the Profit Report.")
+    show_flash("exp_flash")
+
+    mk = month_picker("Expense month", "exp")
+
+    exp_all = read_table("Expenses")
+    cur_exp = exp_all[exp_all["month_key"] == mk]
+
+    if cur_exp.empty:
+        editor_df = pd.DataFrame({"Expense Type": ["", "", ""], "Total (Rs)": [float("nan")] * 3})
+    else:
+        editor_df = pd.DataFrame({
+            "Expense Type": cur_exp["expense_type"].astype(str).values,
+            "Total (Rs)": cur_exp["amount"].astype(float).values,
+        })
+
+    st.session_state.setdefault("exp_ver", 0)
+    st.caption(f"Expenses of {month_label(mk)}: type the expense and its total, then press **Save Expenses** once. "
+               "Click the empty bottom row to add more rows; select a row and press Delete to remove it. "
+               "Saving replaces the expenses of this month with the table.")
+
+    with st.form("expense_form"):
+        edited = st.data_editor(
+            editor_df,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Expense Type": st.column_config.TextColumn("Expense Type", required=False),
+                "Total (Rs)": st.column_config.NumberColumn("Total (Rs)", min_value=0.0, step=0.01, format="%.2f"),
+            },
+            key=f"exp_editor_{mk}_{st.session_state['exp_ver']}",
+        )
+        save_clicked = st.form_submit_button("Save Expenses", type="primary")
+
+    if save_clicked:
+        rows, errors, seen = [], [], set()
+        for _, r in edited.iterrows():
+            etype = "" if pd.isna(r["Expense Type"]) else str(r["Expense Type"]).strip()
+            amt = r["Total (Rs)"]
+            if not etype and pd.isna(amt):
+                continue  # completely empty row
+            if not etype:
+                errors.append("A row has a Total but no Expense Type.")
+            elif pd.isna(amt):
+                errors.append(f"'{etype}' has no Total (Rs).")
+            elif etype.lower() in seen:
+                errors.append(f"'{etype}' is entered twice. Combine them into one row.")
+            else:
+                seen.add(etype.lower())
+                rows.append({"expense_type": etype, "amount": float(amt)})
+        if errors:
+            for e in dict.fromkeys(errors):
+                st.error(e)
+        else:
+            save_expenses(mk, rows, user["username"])
+            st.session_state["exp_ver"] += 1
+            if rows:
+                st.session_state["exp_flash"] = (
+                    f"{len(rows)} expense row{'' if len(rows) == 1 else 's'} saved for {month_label(mk)}.")
+            else:
+                st.session_state["exp_flash"] = f"All expenses of {month_label(mk)} were cleared."
+            st.rerun()
+
+    st.markdown(f'<div class="section-title">Expenses in {month_label(mk)}</div>', unsafe_allow_html=True)
+    if cur_exp.empty:
+        st.info("No expenses saved for this month yet.")
+    else:
+        st.markdown(
+            f'<div class="card kpi-orange"><div class="kpi-label">Total Other Expenses</div>'
+            f'<div class="kpi-value">{money(cur_exp["amount"].sum())}</div></div>',
+            unsafe_allow_html=True
+        )
+
+
+# ============================================================
+# MONTHLY SALES  (Total Sales Rs of a month)
+# ============================================================
+elif page == "Monthly Sales":
+    header("Total Monthly Sale", "Enter the total sales (Rs) of the month. It is used in the Profit Report.")
+    show_flash("sales_flash")
+
+    mk = month_picker("Sales month", "msale")
+
+    sales_all = read_table("Sales")
+    hit = sales_all[sales_all["month_key"] == mk]
+    existing = float(hit.iloc[-1]["total_sales"]) if not hit.empty else 0.0
+
+    st.session_state.setdefault("sales_ver", 0)
+    if hit.empty:
+        st.caption(f"No total sales saved for {month_label(mk)} yet.")
+    else:
+        st.caption(f"Total sales of {month_label(mk)} are already saved ({money(existing)}). "
+                   "Saving again updates that value.")
+
+    with st.form("sales_form"):
+        total = st.number_input(
+            "Total Sales (Rs)", min_value=0.0, value=existing, step=100.0, format="%.2f",
+            key=f"sales_in_{mk}_{st.session_state['sales_ver']}")
+        save_clicked = st.form_submit_button("Save Total Sales", type="primary")
+
+    if save_clicked:
+        if total <= 0:
+            st.error("Enter a Total Sales amount greater than zero.")
+        else:
+            save_monthly_sales(mk, total, user["username"])
+            st.session_state["sales_ver"] += 1
+            st.session_state["sales_flash"] = f"Total sales of {month_label(mk)} saved: {money(total)}."
+            st.rerun()
+
+    st.markdown('<div class="section-title">Saved Monthly Sales</div>', unsafe_allow_html=True)
+    if sales_all.empty:
+        st.info("No monthly sales saved yet.")
+    else:
+        hist = sales_all.sort_values("month_key", ascending=False).copy()
+        hist["Month"] = hist["month_key"].map(month_label)
+        st.dataframe(
+            hist[["Month", "total_sales", "entered_by", "updated_at"]].rename(columns={
+                "total_sales": "Total Sales (Rs)", "entered_by": "Entered By", "updated_at": "Updated At"}),
+            use_container_width=True, hide_index=True,
+            column_config={"Total Sales (Rs)": st.column_config.NumberColumn(format="%.2f")},
+        )
+
+
+# ============================================================
+# PROFIT REPORT
+#   Profit = Total Sales - Total Cost of Sales - Other Expenses
+# ============================================================
+elif page == "Profit Report":
+    header("Profit Report", "Profit = Total Sales − Total Cost of Sales − Other Expenses.")
+
+    mk = month_picker("Report month", "profit")
+    month_name = calendar.month_name[int(mk[5:7])]
+    title = f"Profit Report - {month_name} {mk[:4]}"
+
+    # Total Cost of Sales (from stock + purchases, same calculation as the Sold Quantity PDF)
+    sold = compute_sold_data()
+    sold_m = sold[sold["month_key"] == mk] if sold is not None else None
+    cost_ok = sold_m is not None and not sold_m.empty
+    cost = float(sold_m["cost_of_sales"].sum()) if cost_ok else 0.0
+
+    # Total Sales
+    sales_all = read_table("Sales")
+    s_hit = sales_all[sales_all["month_key"] == mk]
+    sales_ok = not s_hit.empty
+    sales = float(s_hit.iloc[-1]["total_sales"]) if sales_ok else 0.0
+
+    # Other Expenses
+    exp_all = read_table("Expenses")
+    exp_m = exp_all[exp_all["month_key"] == mk]
+    expenses = [(str(t), float(a)) for t, a in zip(exp_m["expense_type"], exp_m["amount"])]
+    other_total = sum(a for _, a in expenses)
+
+    profit = sales - cost - other_total
+
+    if not sales_ok:
+        st.warning(f"Total sales for {month_label(mk)} are not entered yet (Monthly Sales section). "
+                   "Total Sales is shown as 0.")
+    if not cost_ok:
+        st.warning(f"Total Cost of Sales for {month_label(mk)} cannot be calculated yet. Stock entries for "
+                   f"{month_label(previous_month(mk))} and {month_label(mk)} are needed. Cost of Sales is shown as 0.")
+    if not expenses:
+        st.info(f"No other expenses saved for {month_label(mk)}.")
+
+    def money_cell(v):
+        return f"{float(v):,.2f}"
+
+    rows_html = (
+        f'<tr class="head"><td>Total Sales</td><td class="amt">{money_cell(sales)}</td></tr>'
+        f'<tr class="head"><td>Total Cost of Sales</td><td class="amt">{money_cell(cost)}</td></tr>'
+        f'<tr class="head"><td>Other Expenses</td><td class="amt">{money_cell(other_total)}</td></tr>'
+    )
+    for t, a in expenses:
+        rows_html += f'<tr class="sub"><td>{html.escape(t)}</td><td class="amt">{money_cell(a)}</td></tr>'
+    cls = "pos" if profit >= 0 else "neg"
+    rows_html += f'<tr class="profit"><td>Profit</td><td class="amt {cls}">{money_cell(profit)}</td></tr>'
+
+    st.markdown(
+        f'<div class="pl-title">{html.escape(title)}</div>'
+        f'<table class="pl-table"><tbody>{rows_html}</tbody></table>',
+        unsafe_allow_html=True
+    )
+
+    try:
+        pdf_bytes = build_profit_report_pdf(title, sales, cost, expenses, profit)
+        st.download_button(f"📄 Download {title} (PDF)", pdf_bytes, f"profit_report_{mk}.pdf",
+                           "application/pdf", key="profit_pdf_btn")
+    except ImportError:
+        st.error("PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and reboot the app.")
 
 
 # ============================================================
