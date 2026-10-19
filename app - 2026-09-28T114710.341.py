@@ -20,8 +20,8 @@ from gspread.utils import rowcol_to_a1
 #   Stock Entry       : month-end stock (item, size, qty, unit price, description)
 #   Purchases         : purchases of the month (from previous month's stock items)
 #   Sold Quantity     : Sold = Previous month stock + Purchases - This month stock
-#   Other Expenses    : monthly expenses (Expense Type, Total Rs)
-#   Monthly Sales     : total sales (Rs) of the month
+#   Other Expenses    : expenses with Date, Expense Type, Total Rs (editable / deletable)
+#   Monthly Sales     : Cash + Card + QR payments of the month (Total = sum)
 #   Profit Report     : Profit = Total Sales - Total Cost of Sales - Other Expenses
 #   Settings          : users, items (code + main category), password, data import
 #
@@ -151,6 +151,8 @@ div[data-baseweb="popover"] div[role="listbox"] {
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # total_value (last column of Stock and Purchases) is filled ONLY for imported previous data.
+# NOTE: new columns of Expenses (expense_date) and Sales (cash/card/qr) are added at the END, so
+# existing tabs are extended automatically and old data is kept.
 TABLES = {
     "Users": ["id", "username", "password", "full_name", "role", "active", "created_at"],
     "Items": ["id", "item_code", "item_name", "size", "category", "active"],
@@ -158,10 +160,11 @@ TABLES = {
               "description", "entered_by", "updated_at", "total_value"],
     "Purchases": ["id", "month_key", "purchase_date", "item_id", "quantity", "unit_price",
                   "description", "entered_by", "created_at", "total_value"],
-    "Expenses": ["id", "month_key", "expense_type", "amount", "entered_by", "updated_at"],
-    "Sales": ["id", "month_key", "total_sales", "entered_by", "updated_at"],
+    "Expenses": ["id", "month_key", "expense_type", "amount", "entered_by", "updated_at", "expense_date"],
+    "Sales": ["id", "month_key", "total_sales", "entered_by", "updated_at",
+              "cash_sales", "card_sales", "qr_sales"],
 }
-NUMERIC_COLS = ["quantity", "unit_price", "amount", "total_sales"]
+NUMERIC_COLS = ["quantity", "unit_price", "amount", "total_sales", "cash_sales", "card_sales", "qr_sales"]
 
 # Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases, Rest_Expenses, Rest_Sales
 # so they never clash with tabs from your other apps if you reuse the same Google Sheet file.
@@ -179,11 +182,11 @@ def get_spreadsheet():
 
 def get_worksheets():
     # the table list is part of the cache key, so adding a new table never needs a manual reboot
-    return _get_worksheets(tuple(TABLES))
+    return _get_worksheets(tuple(TABLES), tuple(tuple(h) for h in TABLES.values()))
 
 
 @st.cache_resource(show_spinner="Connecting to Google Sheets...")
-def _get_worksheets(table_names):
+def _get_worksheets(table_names, table_headers):
     """Connect once, create any missing worksheet tabs and their header rows."""
     sh = get_spreadsheet()
     # Google Sheets tab names are case-insensitive, so match that way
@@ -383,7 +386,9 @@ def set_purchase_totals(pairs):
 
 def save_expenses(month_key, rows, entered_by):
     """
-    Replace ALL expense rows of one month with `rows` (list of dicts: expense_type, amount).
+    Replace ALL expense rows of one month with `rows`.
+    rows: list of dicts: expense_date (ISO text), expense_type, amount and optional id / entered_by
+          (id and entered_by are kept for rows that already existed).
     Rows of other months are kept untouched. Uses 2-3 API calls however many rows there are.
     """
     ws = get_worksheets()["Expenses"]
@@ -393,7 +398,8 @@ def save_expenses(month_key, rows, entered_by):
     keep = [(list(r) + [""] * len(headers))[:len(headers)]
             for r in values[1:] if len(r) >= 2 and r[0] != "" and r[1] != month_key]
     now = datetime.now().isoformat()
-    new = [[new_id("E"), month_key, r["expense_type"], float(r["amount"]), entered_by, now] for r in rows]
+    new = [[r.get("id") or new_id("E"), month_key, r["expense_type"], float(r["amount"]),
+            r.get("entered_by") or entered_by, now, r["expense_date"]] for r in rows]
     data = [headers] + keep + new
     ws.update(range_name="A1", values=data, value_input_option="RAW")
     if len(values) > len(data):  # old rows that are no longer needed at the bottom
@@ -401,19 +407,26 @@ def save_expenses(month_key, rows, entered_by):
     read_table.clear("Expenses")
 
 
-def save_monthly_sales(month_key, total, entered_by):
-    """One Total Sales value per month: update it if the month exists, otherwise add a new row."""
+def save_monthly_sales(month_key, cash, card, qr, entered_by):
+    """
+    One row per month: Cash + Card + QR payments. total_sales (= the sum) is what the Profit Report uses.
+    Update the row if the month exists, otherwise add a new row.
+    """
     ws = get_worksheets()["Sales"]
     values = ws.get_all_values()
     now = datetime.now().isoformat()
+    cash, card, qr = float(cash), float(card), float(qr)
+    total = cash + card + qr
     for i, r in enumerate(values[1:], start=2):
         if len(r) >= 2 and r[0] != "" and r[1] == month_key:
-            # columns C..E = total_sales, entered_by, updated_at
-            ws.batch_update([{"range": f"C{i}:E{i}", "values": [[float(total), entered_by, now]]}],
+            # columns C..H = total_sales, entered_by, updated_at, cash_sales, card_sales, qr_sales
+            ws.batch_update([{"range": f"C{i}:H{i}",
+                              "values": [[total, entered_by, now, cash, card, qr]]}],
                             value_input_option="RAW")
             break
     else:
-        ws.append_row([new_id("M"), month_key, float(total), entered_by, now], value_input_option="RAW")
+        ws.append_row([new_id("M"), month_key, total, entered_by, now, cash, card, qr],
+                      value_input_option="RAW")
     read_table.clear("Sales")
 
 
@@ -1554,79 +1567,158 @@ elif page == "Sold Quantity":
 
 
 # ============================================================
-# OTHER EXPENSES  (monthly table: Expense Type + Total Rs)
+# OTHER EXPENSES
+#   Add: Date + Expense Type (typed, with suggestions of old types) + Total
+#   Table of the selected month at the bottom: edit cells, delete rows, Save Changes
 # ============================================================
 elif page == "Other Expenses":
     header("Other Expenses",
-           "Enter the other expenses of the month (rent, salaries, electricity, ...). "
+           "Enter the other expenses (rent, salaries, electricity, ...) with their date. "
            "They are deducted in the Profit Report.")
     show_flash("exp_flash")
 
     mk = month_picker("Expense month", "exp")
+    y, m = int(mk[:4]), int(mk[5:7])
+    first_day = date(y, m, 1)
+    last_day = date(y, m, calendar.monthrange(y, m)[1])
 
     exp_all = read_table("Expenses")
-    cur_exp = exp_all[exp_all["month_key"] == mk]
+    cur_exp = exp_all[exp_all["month_key"] == mk].copy()
+
+    # Previously entered expense types (all months) - suggested while the user types
+    known_types = sorted({str(t).strip() for t in exp_all["expense_type"] if str(t).strip()},
+                         key=lambda s: s.lower())
+    type_case = {t.lower(): t for t in known_types}  # reuse the old spelling, e.g. "rent" -> "Rent"
+
+    st.session_state.setdefault("exp_ver", 0)
+
+    # ---------------- ADD AN EXPENSE ----------------
+    st.markdown('<div class="section-title">Add an Expense</div>', unsafe_allow_html=True)
+    st.caption("Type the expense type, or pick one of the earlier types from the list "
+               "(the list narrows down as you type). A new type is saved automatically.")
+
+    today = date.today()
+    default_date = today if first_day <= today <= last_day else first_day
+
+    with st.form("expense_add_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 1.6, 1])
+        e_date = c1.date_input("Date", value=default_date, min_value=first_day, max_value=last_day,
+                               key=f"exp_date_{mk}_{st.session_state['exp_ver']}")
+        try:
+            e_type = c2.selectbox(
+                "Expense Type", known_types, index=None, accept_new_options=True,
+                placeholder="Type or choose an expense type",
+                key=f"exp_type_{st.session_state['exp_ver']}")
+        except TypeError:  # older Streamlit without accept_new_options: plain text box
+            e_type = c2.text_input("Expense Type", placeholder="Type the expense type",
+                                   key=f"exp_type_txt_{st.session_state['exp_ver']}")
+            if known_types:
+                c2.caption("Earlier types: " + ", ".join(known_types))
+        e_amt = c3.number_input("Total (Rs)", min_value=0.0, value=0.0, step=100.0, format="%.2f",
+                                key=f"exp_amt_{st.session_state['exp_ver']}")
+        add_clicked = st.form_submit_button("➕ Add Expense", type="primary")
+
+    if add_clicked:
+        etype = (e_type or "").strip()
+        if not etype:
+            st.error("Enter or choose an Expense Type.")
+        elif e_amt <= 0:
+            st.error("Enter a Total greater than zero.")
+        else:
+            etype = type_case.get(etype.lower(), etype)
+            add_row("Expenses", {
+                "id": new_id("E"), "month_key": f"{e_date.year}-{e_date.month:02d}",
+                "expense_date": e_date.isoformat(), "expense_type": etype,
+                "amount": float(e_amt), "entered_by": user["username"],
+                "updated_at": datetime.now().isoformat(),
+            })
+            st.session_state["exp_ver"] += 1
+            st.session_state["exp_flash"] = f"Expense added: {etype} - {money(e_amt)} on {e_date.isoformat()}."
+            st.rerun()
+
+    # ---------------- EXPENSES OF THE SELECTED MONTH ----------------
+    st.markdown(f'<div class="section-title">Expenses in {month_label(mk)}</div>', unsafe_allow_html=True)
 
     if cur_exp.empty:
-        editor_df = pd.DataFrame({"Expense Type": ["", "", ""], "Total (Rs)": [float("nan")] * 3})
+        st.info("No expenses saved for this month yet.")
     else:
+        # old rows saved before the Date column existed show the 1st of the month
+        cur_exp["expense_date"] = cur_exp["expense_date"].astype(str).str.strip()
+        cur_exp["date_value"] = pd.to_datetime(cur_exp["expense_date"], errors="coerce")
+        cur_exp["date_value"] = cur_exp["date_value"].fillna(pd.Timestamp(first_day))
+        cur_exp = cur_exp.sort_values(["date_value", "updated_at"]).reset_index(drop=True)
+
         editor_df = pd.DataFrame({
+            "id": cur_exp["id"].astype(str).values,
+            "Date": [d.date() for d in cur_exp["date_value"]],
             "Expense Type": cur_exp["expense_type"].astype(str).values,
             "Total (Rs)": cur_exp["amount"].astype(float).values,
         })
 
-    st.session_state.setdefault("exp_ver", 0)
-    st.caption(f"Expenses of {month_label(mk)}: type the expense and its total, then press **Save Expenses** once. "
-               "Click the empty bottom row to add more rows; select a row and press Delete to remove it. "
-               "Saving replaces the expenses of this month with the table.")
+        st.caption("Made a mistake? Change a Date, Expense Type or Total directly in the table. "
+                   "To delete a record, tick the box on the left of the row and press the Delete key "
+                   "(or the bin icon), then press **Save Changes**. Nothing is changed until you save.")
 
-    with st.form("expense_form"):
-        edited = st.data_editor(
-            editor_df,
-            hide_index=True,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "Expense Type": st.column_config.TextColumn("Expense Type", required=False),
-                "Total (Rs)": st.column_config.NumberColumn("Total (Rs)", min_value=0.0, step=0.01, format="%.2f"),
-            },
-            key=f"exp_editor_{mk}_{st.session_state['exp_ver']}",
-        )
-        save_clicked = st.form_submit_button("Save Expenses", type="primary")
+        with st.form("expense_edit_form"):
+            edited = st.data_editor(
+                editor_df,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "id": None,
+                    "Date": st.column_config.DateColumn(
+                        "Date", min_value=first_day, max_value=last_day, format="YYYY-MM-DD"),
+                    "Expense Type": st.column_config.TextColumn("Expense Type", required=False),
+                    "Total (Rs)": st.column_config.NumberColumn(
+                        "Total (Rs)", min_value=0.0, step=0.01, format="%.2f"),
+                },
+                key=f"exp_editor_{mk}_{st.session_state['exp_ver']}",
+            )
+            save_clicked = st.form_submit_button("💾 Save Changes", type="primary")
 
-    if save_clicked:
-        rows, errors, seen = [], [], set()
-        for _, r in edited.iterrows():
-            etype = "" if pd.isna(r["Expense Type"]) else str(r["Expense Type"]).strip()
-            amt = r["Total (Rs)"]
-            if not etype and pd.isna(amt):
-                continue  # completely empty row
-            if not etype:
-                errors.append("A row has a Total but no Expense Type.")
-            elif pd.isna(amt):
-                errors.append(f"'{etype}' has no Total (Rs).")
-            elif etype.lower() in seen:
-                errors.append(f"'{etype}' is entered twice. Combine them into one row.")
+        if save_clicked:
+            by_id = {r["id"]: r["entered_by"] for _, r in cur_exp.iterrows()}
+            rows, errors = [], []
+            for _, r in edited.iterrows():
+                etype = "" if pd.isna(r["Expense Type"]) else str(r["Expense Type"]).strip()
+                amt = r["Total (Rs)"]
+                d = r["Date"]
+                if not etype and pd.isna(amt):
+                    continue  # completely empty row
+                if not etype:
+                    errors.append("A row has a Total but no Expense Type.")
+                    continue
+                if pd.isna(amt):
+                    errors.append(f"'{etype}' has no Total (Rs).")
+                    continue
+                if pd.isna(d):
+                    errors.append(f"'{etype}' has no Date.")
+                    continue
+                d = pd.to_datetime(d).date()
+                if not (first_day <= d <= last_day):
+                    errors.append(f"'{etype}': the Date must be inside {month_label(mk)}.")
+                    continue
+                rid = None if pd.isna(r["id"]) else str(r["id"])
+                rows.append({
+                    "id": rid, "expense_date": d.isoformat(),
+                    "expense_type": type_case.get(etype.lower(), etype),
+                    "amount": float(amt), "entered_by": by_id.get(rid) if rid else None,
+                })
+            if errors:
+                for e in dict.fromkeys(errors):
+                    st.error(e)
             else:
-                seen.add(etype.lower())
-                rows.append({"expense_type": etype, "amount": float(amt)})
-        if errors:
-            for e in dict.fromkeys(errors):
-                st.error(e)
-        else:
-            save_expenses(mk, rows, user["username"])
-            st.session_state["exp_ver"] += 1
-            if rows:
-                st.session_state["exp_flash"] = (
-                    f"{len(rows)} expense row{'' if len(rows) == 1 else 's'} saved for {month_label(mk)}.")
-            else:
-                st.session_state["exp_flash"] = f"All expenses of {month_label(mk)} were cleared."
-            st.rerun()
+                save_expenses(mk, rows, user["username"])
+                st.session_state["exp_ver"] += 1
+                if rows:
+                    st.session_state["exp_flash"] = (
+                        f"Changes saved: {len(rows)} expense record{'' if len(rows) == 1 else 's'} "
+                        f"in {month_label(mk)}.")
+                else:
+                    st.session_state["exp_flash"] = f"All expenses of {month_label(mk)} were deleted."
+                st.rerun()
 
-    st.markdown(f'<div class="section-title">Expenses in {month_label(mk)}</div>', unsafe_allow_html=True)
-    if cur_exp.empty:
-        st.info("No expenses saved for this month yet.")
-    else:
         st.markdown(
             f'<div class="card kpi-orange"><div class="kpi-label">Total Other Expenses</div>'
             f'<div class="kpi-value">{money(cur_exp["amount"].sum())}</div></div>',
@@ -1635,39 +1727,64 @@ elif page == "Other Expenses":
 
 
 # ============================================================
-# MONTHLY SALES  (Total Sales Rs of a month)
+# MONTHLY SALES  (Cash + Card + QR payments of a month)
 # ============================================================
 elif page == "Monthly Sales":
-    header("Total Monthly Sale", "Enter the total sales (Rs) of the month. It is used in the Profit Report.")
+    header("Total Monthly Sale",
+           "Enter the sales of the month by payment type (Cash, Card, QR). "
+           "The total is used in the Profit Report.")
     show_flash("sales_flash")
 
     mk = month_picker("Sales month", "msale")
 
     sales_all = read_table("Sales")
     hit = sales_all[sales_all["month_key"] == mk]
-    existing = float(hit.iloc[-1]["total_sales"]) if not hit.empty else 0.0
+    if hit.empty:
+        ex_cash = ex_card = ex_qr = ex_total = 0.0
+    else:
+        last = hit.iloc[-1]
+        ex_cash, ex_card, ex_qr = float(last["cash_sales"]), float(last["card_sales"]), float(last["qr_sales"])
+        ex_total = float(last["total_sales"])
 
     st.session_state.setdefault("sales_ver", 0)
     if hit.empty:
-        st.caption(f"No total sales saved for {month_label(mk)} yet.")
+        st.caption(f"No sales saved for {month_label(mk)} yet.")
+    elif ex_total > 0 and (ex_cash + ex_card + ex_qr) == 0:
+        st.warning(f"The total sales of {month_label(mk)} ({money(ex_total)}) were saved before the Cash / Card / QR "
+                   "split existed. Enter the three amounts below and save to replace that total.")
     else:
-        st.caption(f"Total sales of {month_label(mk)} are already saved ({money(existing)}). "
-                   "Saving again updates that value.")
+        st.caption(f"Sales of {month_label(mk)} are already saved ({money(ex_total)}). "
+                   "Saving again updates these values.")
 
     with st.form("sales_form"):
-        total = st.number_input(
-            "Total Sales (Rs)", min_value=0.0, value=existing, step=100.0, format="%.2f",
-            key=f"sales_in_{mk}_{st.session_state['sales_ver']}")
-        save_clicked = st.form_submit_button("Save Total Sales", type="primary")
+        s1, s2, s3 = st.columns(3)
+        v = st.session_state["sales_ver"]
+        cash = s1.number_input("Cash Sales (Rs)", min_value=0.0, value=ex_cash, step=100.0, format="%.2f",
+                               key=f"sales_cash_{mk}_{v}")
+        card = s2.number_input("Card Sales (Rs)", min_value=0.0, value=ex_card, step=100.0, format="%.2f",
+                               key=f"sales_card_{mk}_{v}")
+        qr = s3.number_input("QR Payments (Rs)", min_value=0.0, value=ex_qr, step=100.0, format="%.2f",
+                             key=f"sales_qr_{mk}_{v}")
+        save_clicked = st.form_submit_button("Save Sales", type="primary")
 
     if save_clicked:
+        total = cash + card + qr
         if total <= 0:
-            st.error("Enter a Total Sales amount greater than zero.")
+            st.error("Enter at least one amount (Cash, Card or QR) greater than zero.")
         else:
-            save_monthly_sales(mk, total, user["username"])
+            save_monthly_sales(mk, cash, card, qr, user["username"])
             st.session_state["sales_ver"] += 1
-            st.session_state["sales_flash"] = f"Total sales of {month_label(mk)} saved: {money(total)}."
+            st.session_state["sales_flash"] = (
+                f"Sales of {month_label(mk)} saved: Cash {money(cash)} + Card {money(card)} "
+                f"+ QR {money(qr)} = Total {money(total)}.")
             st.rerun()
+
+    if not hit.empty:
+        st.markdown(
+            f'<div class="card kpi-green"><div class="kpi-label">Total Sales - {month_label(mk)}</div>'
+            f'<div class="kpi-value">{money(ex_total)}</div></div>',
+            unsafe_allow_html=True
+        )
 
     st.markdown('<div class="section-title">Saved Monthly Sales</div>', unsafe_allow_html=True)
     if sales_all.empty:
@@ -1676,10 +1793,16 @@ elif page == "Monthly Sales":
         hist = sales_all.sort_values("month_key", ascending=False).copy()
         hist["Month"] = hist["month_key"].map(month_label)
         st.dataframe(
-            hist[["Month", "total_sales", "entered_by", "updated_at"]].rename(columns={
+            hist[["Month", "cash_sales", "card_sales", "qr_sales", "total_sales", "entered_by", "updated_at"]].rename(columns={
+                "cash_sales": "Cash (Rs)", "card_sales": "Card (Rs)", "qr_sales": "QR (Rs)",
                 "total_sales": "Total Sales (Rs)", "entered_by": "Entered By", "updated_at": "Updated At"}),
             use_container_width=True, hide_index=True,
-            column_config={"Total Sales (Rs)": st.column_config.NumberColumn(format="%.2f")},
+            column_config={
+                "Cash (Rs)": st.column_config.NumberColumn(format="%.2f"),
+                "Card (Rs)": st.column_config.NumberColumn(format="%.2f"),
+                "QR (Rs)": st.column_config.NumberColumn(format="%.2f"),
+                "Total Sales (Rs)": st.column_config.NumberColumn(format="%.2f"),
+            },
         )
 
 
