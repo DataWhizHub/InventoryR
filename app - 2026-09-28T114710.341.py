@@ -1570,6 +1570,7 @@ elif page == "Sold Quantity":
 # OTHER EXPENSES
 #   Add: Date + Expense Type (typed, with suggestions of old types) + Total
 #   Table of the selected month at the bottom: edit cells, delete rows, Save Changes
+#   Delete option: pick one expense entry and delete it
 # ============================================================
 elif page == "Other Expenses":
     header("Other Expenses",
@@ -1724,6 +1725,21 @@ elif page == "Other Expenses":
             f'<div class="kpi-value">{money(cur_exp["amount"].sum())}</div></div>',
             unsafe_allow_html=True
         )
+
+        # ---------------- DELETE AN EXPENSE ENTRY ----------------
+        with st.expander("🗑️ Delete an expense entry"):
+            exp_labels = {
+                r["id"]: f'{r["date_value"].date().isoformat()} • {r["expense_type"]} • {money(r["amount"])}'
+                for _, r in cur_exp.iterrows()
+            }
+            del_exp_id = st.selectbox(
+                "Expense entry", list(exp_labels.keys()), format_func=lambda x: exp_labels[x],
+                key=f"del_exp_{mk}_{st.session_state['exp_ver']}")
+            if st.button("Delete Entry", key=f"del_exp_btn_{mk}"):
+                delete_row("Expenses", del_exp_id)
+                st.session_state["exp_ver"] += 1
+                st.session_state["exp_flash"] = f"Expense deleted: {exp_labels[del_exp_id]}."
+                st.rerun()
 
 
 # ============================================================
