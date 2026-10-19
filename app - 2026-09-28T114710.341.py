@@ -1528,16 +1528,17 @@ elif page == "Sold Quantity":
                 st.altair_chart(chart, use_container_width=True, theme=None)
 
                 st.markdown('<div class="section-title">Details</div>', unsafe_allow_html=True)
+                # "Cost of Sales" (last column) = same calculation as in the PDF report / Profit Report
                 table = view.sort_values(["month_key", "category", "item_name", "size"])[
                     ["month_key", "item_code", "category", "item_name", "size", "opening_qty", "opening_price",
-                     "purchase_qty", "closing_qty", "unit_price", "sold_qty"]
+                     "purchase_qty", "closing_qty", "unit_price", "sold_qty", "cost_of_sales"]
                 ].rename(columns={
                     "month_key": "Month", "item_code": "Code", "category": "Main Category",
                     "item_name": "Item", "size": "Size / Variety",
                     "opening_qty": "Previous Stock", "opening_price": "Previous Unit Price",
                     "purchase_qty": "Purchases",
                     "closing_qty": "This Month Stock", "unit_price": "Unit Price",
-                    "sold_qty": "Quantity Sold",
+                    "sold_qty": "Quantity Sold", "cost_of_sales": "Cost of Sales",
                 })
                 st.dataframe(table, use_container_width=True, hide_index=True)
 
@@ -1744,6 +1745,7 @@ elif page == "Other Expenses":
 
 # ============================================================
 # MONTHLY SALES  (Cash + Card + QR payments of a month)
+#   Delete option: pick one saved month and delete its sales entry
 # ============================================================
 elif page == "Monthly Sales":
     header("Total Monthly Sale",
@@ -1820,6 +1822,23 @@ elif page == "Monthly Sales":
                 "Total Sales (Rs)": st.column_config.NumberColumn(format="%.2f"),
             },
         )
+
+        # ---------------- DELETE A MONTHLY SALES ENTRY ----------------
+        with st.expander("🗑️ Delete a monthly sales entry"):
+            sales_labels = {
+                r["id"]: f'{month_label(r["month_key"])} • Cash {money(r["cash_sales"])} • '
+                         f'Card {money(r["card_sales"])} • QR {money(r["qr_sales"])} • '
+                         f'Total {money(r["total_sales"])}'
+                for _, r in hist.iterrows()
+            }
+            del_sales_id = st.selectbox(
+                "Sales entry", list(sales_labels.keys()), format_func=lambda x: sales_labels[x],
+                key=f"del_sales_{st.session_state['sales_ver']}")
+            if st.button("Delete Entry", key="del_sales_btn"):
+                delete_row("Sales", del_sales_id)
+                st.session_state["sales_ver"] += 1
+                st.session_state["sales_flash"] = f"Sales entry deleted: {sales_labels[del_sales_id]}."
+                st.rerun()
 
 
 # ============================================================
