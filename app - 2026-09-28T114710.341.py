@@ -829,6 +829,8 @@ def build_profit_report_pdf(title, sales, cost, expenses, profit):
     """
     Profit Report PDF (portrait A4).
     expenses: list of (expense_type, amount). Profit = Total Sales - Total Cost of Sales - Other Expenses.
+    Under "Other Expenses" every expense type is shown ONCE with its total
+    (several entries of the same type, e.g. on different dates, are added together).
     """
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -838,11 +840,22 @@ def build_profit_report_pdf(title, sales, cost, expenses, profit):
     def n2(x):
         return f"{float(x):,.2f}"
 
-    other_total = sum(a for _, a in expenses)
+    # ---- total of each expense type (same type = one row; first spelling / order is kept) ----
+    type_totals = {}   # lower-case type -> [display name, total]
+    for t, a in expenses:
+        name = str(t).strip()
+        key = name.lower()
+        if key in type_totals:
+            type_totals[key][1] += float(a)
+        else:
+            type_totals[key] = [name, float(a)]
+    expense_rows = [(name, total) for name, total in type_totals.values()]
+
+    other_total = sum(a for _, a in expense_rows)
     data = [["Total Sales", n2(sales)],
             ["Total Cost of Sales", n2(cost)],
             ["Other Expenses", n2(other_total)]]
-    for t, a in expenses:
+    for t, a in expense_rows:
         data.append([t, n2(a)])
     data.append(["Profit", n2(profit)])
     profit_row = len(data) - 1
