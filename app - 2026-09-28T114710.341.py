@@ -21,6 +21,8 @@ from gspread.utils import rowcol_to_a1
 #   Purchases         : purchases of the month (from previous month's stock items)
 #   Sold Quantity     : Sold = Previous month stock + Purchases - This month stock
 #   Other Expenses    : expenses with Date, Expense Type, Total Rs (editable / deletable)
+#   Daily Sales       : sales of every day with Date, Payment Type (Cash / Card / QR), Amount Rs
+#                       (editable / deletable). The month's total is used in the Profit Report
 #   Monthly Sales     : Cash + Card + QR payments of the month (Total = sum)
 #   Profit Report     : Profit = Total Sales - Total Cost of Sales - Other Expenses
 #   Settings          : users, items (code + main category), password, data import
@@ -153,6 +155,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # total_value (last column of Stock and Purchases) is filled ONLY for imported previous data.
 # NOTE: new columns of Expenses (expense_date) and Sales (cash/card/qr) are added at the END, so
 # existing tabs are extended automatically and old data is kept.
+# NOTE: "DailySales" is a NEW table (tab Rest_DailySales). It is created automatically on first start.
 TABLES = {
     "Users": ["id", "username", "password", "full_name", "role", "active", "created_at"],
     "Items": ["id", "item_code", "item_name", "size", "category", "active"],
@@ -163,11 +166,13 @@ TABLES = {
     "Expenses": ["id", "month_key", "expense_type", "amount", "entered_by", "updated_at", "expense_date"],
     "Sales": ["id", "month_key", "total_sales", "entered_by", "updated_at",
               "cash_sales", "card_sales", "qr_sales"],
+    "DailySales": ["id", "month_key", "sale_date", "payment_type", "amount", "entered_by", "updated_at"],
 }
 NUMERIC_COLS = ["quantity", "unit_price", "amount", "total_sales", "cash_sales", "card_sales", "qr_sales"]
+PAYMENT_TYPES = ["Cash", "Card", "QR"]  # payment types of the Daily Sales section
 
-# Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases, Rest_Expenses, Rest_Sales
-# so they never clash with tabs from your other apps if you reuse the same Google Sheet file.
+# Tabs are created as Rest_Users, Rest_Items, Rest_Stock, Rest_Purchases, Rest_Expenses, Rest_Sales,
+# Rest_DailySales so they never clash with tabs from your other apps if you reuse the same Google Sheet file.
 TAB_PREFIX = "Rest_"
 IMPORT_TAB = "Rest_Import"  # paste your old data here, then import from Settings > Import Data
 
@@ -405,6 +410,30 @@ def save_expenses(month_key, rows, entered_by):
     if len(values) > len(data):  # old rows that are no longer needed at the bottom
         ws.batch_clear([f"A{len(data) + 1}:{rowcol_to_a1(len(values), len(headers))}"])
     read_table.clear("Expenses")
+
+
+def save_daily_sales(month_key, rows, entered_by):
+    """
+    Replace ALL daily sales rows of one month with `rows`.
+    rows: list of dicts: sale_date (ISO text), payment_type (Cash / Card / QR), amount and optional
+          id / entered_by (id and entered_by are kept for rows that already existed).
+    Rows of other months are kept untouched. Uses 2-4 API calls however many rows there are.
+    """
+    ws = get_worksheets()["DailySales"]
+    headers = TABLES["DailySales"]
+    values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    keep = [(list(r) + [""] * len(headers))[:len(headers)]
+            for r in values[1:] if len(r) >= 2 and r[0] != "" and r[1] != month_key]
+    now = datetime.now().isoformat()
+    new = [[r.get("id") or new_id("D"), month_key, r["sale_date"], r["payment_type"], float(r["amount"]),
+            r.get("entered_by") or entered_by, now] for r in rows]
+    data = [headers] + keep + new
+    if ws.row_count < len(data) + 100:  # make sure the tab has enough rows for all the data
+        ws.add_rows(len(data) + 100 - ws.row_count)
+    ws.update(range_name="A1", values=data, value_input_option="RAW")
+    if len(values) > len(data):  # old rows that are no longer needed at the bottom
+        ws.batch_clear([f"A{len(data) + 1}:{rowcol_to_a1(len(values), len(headers))}"])
+    read_table.clear("DailySales")
 
 
 def save_monthly_sales(month_key, cash, card, qr, entered_by):
@@ -1142,7 +1171,8 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-menu = ["Stock Entry", "Purchases", "Sold Quantity", "Other Expenses", "Monthly Sales", "Profit Report"]
+menu = ["Stock Entry", "Purchases", "Sold Quantity", "Other Expenses", "Daily Sales", "Monthly Sales",
+        "Profit Report"]
 if is_admin:
     menu.append("Settings")
 
@@ -1757,6 +1787,213 @@ elif page == "Other Expenses":
 
 
 # ============================================================
+# DAILY SALES  (one entry per day and payment type: Cash / Card / QR)
+#   Add: Date + Payment Type + Amount (Rs)
+#   Table of the selected month: edit cells, delete rows, Save Changes
+#   Summary of the month: day-wise table and Cash / Card / QR / Total sums
+#   The month's total is used in the Profit Report
+# ============================================================
+elif page == "Daily Sales":
+    header("Daily Sales",
+           "Enter the sales of each day by payment type (Cash, Card, QR). "
+           "The total of the month is used in the Profit Report.")
+    show_flash("dsale_flash")
+
+    mk = month_picker("Sales month", "dsale")
+    y, m = int(mk[:4]), int(mk[5:7])
+    first_day = date(y, m, 1)
+    last_day = date(y, m, calendar.monthrange(y, m)[1])
+
+    ds_all = read_table("DailySales")
+    cur_ds = ds_all[ds_all["month_key"] == mk].copy()
+
+    st.session_state.setdefault("dsale_ver", 0)
+
+    # ---------------- ADD DAILY SALES ----------------
+    st.markdown('<div class="section-title">Add Daily Sales</div>', unsafe_allow_html=True)
+    st.caption("Choose the date and the payment type, then enter the amount. "
+               "If a day has Cash, Card and QR sales, add one entry for each payment type.")
+
+    today = date.today()
+    default_date = today if first_day <= today <= last_day else first_day
+
+    with st.form("dsale_add_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 1, 1])
+        d_date = c1.date_input("Date", value=default_date, min_value=first_day, max_value=last_day,
+                               key=f"dsale_date_{mk}_{st.session_state['dsale_ver']}")
+        d_type = c2.selectbox("Payment Type", PAYMENT_TYPES,
+                              key=f"dsale_type_{st.session_state['dsale_ver']}")
+        d_amt = c3.number_input("Amount (Rs)", min_value=0.0, value=0.0, step=100.0, format="%.2f",
+                                key=f"dsale_amt_{st.session_state['dsale_ver']}")
+        add_clicked = st.form_submit_button("➕ Add Sales", type="primary")
+
+    if add_clicked:
+        if d_amt <= 0:
+            st.error("Enter an Amount greater than zero.")
+        else:
+            add_row("DailySales", {
+                "id": new_id("D"), "month_key": f"{d_date.year}-{d_date.month:02d}",
+                "sale_date": d_date.isoformat(), "payment_type": d_type,
+                "amount": float(d_amt), "entered_by": user["username"],
+                "updated_at": datetime.now().isoformat(),
+            })
+            st.session_state["dsale_ver"] += 1
+            st.session_state["dsale_flash"] = (
+                f"Sales added: {d_type} - {money(d_amt)} on {d_date.isoformat()}.")
+            st.rerun()
+
+    # ---------------- DAILY SALES OF THE SELECTED MONTH ----------------
+    st.markdown(f'<div class="section-title">Daily Sales in {month_label(mk)}</div>', unsafe_allow_html=True)
+
+    if cur_ds.empty:
+        st.info("No daily sales saved for this month yet.")
+    else:
+        cur_ds["sale_date"] = cur_ds["sale_date"].astype(str).str.strip()
+        cur_ds["date_value"] = pd.to_datetime(cur_ds["sale_date"], errors="coerce")
+        cur_ds["date_value"] = cur_ds["date_value"].fillna(pd.Timestamp(first_day))
+        cur_ds["payment_type"] = cur_ds["payment_type"].astype(str).str.strip()
+        cur_ds = cur_ds.sort_values(["date_value", "updated_at"]).reset_index(drop=True)
+
+        editor_df = pd.DataFrame({
+            "id": cur_ds["id"].astype(str).values,
+            "Date": [d.date() for d in cur_ds["date_value"]],
+            "Payment Type": cur_ds["payment_type"].values,
+            "Amount (Rs)": cur_ds["amount"].astype(float).values,
+        })
+
+        st.caption("Made a mistake? Change a Date, Payment Type or Amount directly in the table. "
+                   "To delete a record, tick the box on the left of the row and press the Delete key "
+                   "(or the bin icon), then press **Save Changes**. Nothing is changed until you save.")
+
+        with st.form("dsale_edit_form"):
+            edited = st.data_editor(
+                editor_df,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "id": None,
+                    "Date": st.column_config.DateColumn(
+                        "Date", min_value=first_day, max_value=last_day, format="YYYY-MM-DD"),
+                    "Payment Type": st.column_config.SelectboxColumn(
+                        "Payment Type", options=PAYMENT_TYPES, required=False),
+                    "Amount (Rs)": st.column_config.NumberColumn(
+                        "Amount (Rs)", min_value=0.0, step=0.01, format="%.2f"),
+                },
+                key=f"dsale_editor_{mk}_{st.session_state['dsale_ver']}",
+            )
+            save_clicked = st.form_submit_button("💾 Save Changes", type="primary")
+
+        if save_clicked:
+            by_id = {r["id"]: r["entered_by"] for _, r in cur_ds.iterrows()}
+            type_map = {t.lower(): t for t in PAYMENT_TYPES}
+            rows, errors = [], []
+            for _, r in edited.iterrows():
+                ptype = "" if pd.isna(r["Payment Type"]) else str(r["Payment Type"]).strip()
+                amt = r["Amount (Rs)"]
+                d = r["Date"]
+                if not ptype and pd.isna(amt):
+                    continue  # completely empty row
+                if not ptype:
+                    errors.append("A row has an Amount but no Payment Type.")
+                    continue
+                if ptype.lower() not in type_map:
+                    errors.append(f"'{ptype}' is not a valid Payment Type (Cash, Card or QR).")
+                    continue
+                if pd.isna(amt):
+                    errors.append(f"'{ptype}' has no Amount (Rs).")
+                    continue
+                if pd.isna(d):
+                    errors.append(f"'{ptype}' has no Date.")
+                    continue
+                d = pd.to_datetime(d).date()
+                if not (first_day <= d <= last_day):
+                    errors.append(f"'{ptype}': the Date must be inside {month_label(mk)}.")
+                    continue
+                rid = None if pd.isna(r["id"]) else str(r["id"])
+                rows.append({
+                    "id": rid, "sale_date": d.isoformat(),
+                    "payment_type": type_map[ptype.lower()],
+                    "amount": float(amt), "entered_by": by_id.get(rid) if rid else None,
+                })
+            if errors:
+                for e in dict.fromkeys(errors):
+                    st.error(e)
+            else:
+                save_daily_sales(mk, rows, user["username"])
+                st.session_state["dsale_ver"] += 1
+                if rows:
+                    st.session_state["dsale_flash"] = (
+                        f"Changes saved: {len(rows)} sales record{'' if len(rows) == 1 else 's'} "
+                        f"in {month_label(mk)}.")
+                else:
+                    st.session_state["dsale_flash"] = f"All daily sales of {month_label(mk)} were deleted."
+                st.rerun()
+
+        # ---------------- MONTH SUMMARY (sum of Cash / Card / QR) ----------------
+        by_type = cur_ds.groupby("payment_type")["amount"].sum()
+        cash_t = float(by_type.get("Cash", 0.0))
+        card_t = float(by_type.get("Card", 0.0))
+        qr_t = float(by_type.get("QR", 0.0))
+        total_t = float(cur_ds["amount"].sum())
+
+        st.markdown(f'<div class="section-title">Total Sales - {month_label(mk)}</div>', unsafe_allow_html=True)
+        k1, k2, k3, k4 = st.columns(4)
+        for k, (label, value, cls) in zip(
+            [k1, k2, k3, k4],
+            [("Cash", cash_t, "kpi-blue"), ("Card", card_t, "kpi-blue"),
+             ("QR Payments", qr_t, "kpi-blue"), ("Total Sales", total_t, "kpi-green")]
+        ):
+            with k:
+                st.markdown(
+                    f'<div class="card {cls}"><div class="kpi-label">{label}</div>'
+                    f'<div class="kpi-value">{money(value)}</div></div>',
+                    unsafe_allow_html=True
+                )
+
+        # ---------------- DAY-WISE SUMMARY ----------------
+        st.markdown('<div class="section-title">Day-wise Summary</div>', unsafe_allow_html=True)
+        pivot = cur_ds.pivot_table(index="date_value", columns="payment_type", values="amount",
+                                   aggfunc="sum", fill_value=0.0)
+        for p in PAYMENT_TYPES:
+            if p not in pivot.columns:
+                pivot[p] = 0.0
+        pivot = pivot[PAYMENT_TYPES].copy()
+        pivot["Total"] = pivot.sum(axis=1)
+        pivot.index = [d.date().isoformat() for d in pivot.index]
+        pivot.index.name = "Date"
+        pivot = pivot.reset_index()
+        total_row = {"Date": "Total"}
+        for c in PAYMENT_TYPES + ["Total"]:
+            total_row[c] = float(pivot[c].sum())
+        pivot = pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
+        st.dataframe(
+            pivot, use_container_width=True, hide_index=True,
+            column_config={
+                "Cash": st.column_config.NumberColumn("Cash (Rs)", format="%.2f"),
+                "Card": st.column_config.NumberColumn("Card (Rs)", format="%.2f"),
+                "QR": st.column_config.NumberColumn("QR (Rs)", format="%.2f"),
+                "Total": st.column_config.NumberColumn("Total (Rs)", format="%.2f"),
+            },
+        )
+
+        # ---------------- DELETE A DAILY SALES ENTRY ----------------
+        with st.expander("🗑️ Delete a daily sales entry"):
+            ds_labels = {
+                r["id"]: f'{r["date_value"].date().isoformat()} • {r["payment_type"]} • {money(r["amount"])}'
+                for _, r in cur_ds.iterrows()
+            }
+            del_ds_id = st.selectbox(
+                "Sales entry", list(ds_labels.keys()), format_func=lambda x: ds_labels[x],
+                key=f"del_dsale_{mk}_{st.session_state['dsale_ver']}")
+            if st.button("Delete Entry", key=f"del_dsale_btn_{mk}"):
+                delete_row("DailySales", del_ds_id)
+                st.session_state["dsale_ver"] += 1
+                st.session_state["dsale_flash"] = f"Daily sales entry deleted: {ds_labels[del_ds_id]}."
+                st.rerun()
+
+
+# ============================================================
 # MONTHLY SALES  (Cash + Card + QR payments of a month)
 #   Delete option: pick one saved month and delete its sales entry
 # ============================================================
@@ -1857,6 +2094,8 @@ elif page == "Monthly Sales":
 # ============================================================
 # PROFIT REPORT
 #   Profit = Total Sales - Total Cost of Sales - Other Expenses
+#   Total Sales = sum of the month's Daily Sales (Cash + Card + QR); if no daily sales are
+#   entered for the month, the Monthly Sales total is used.
 # ============================================================
 elif page == "Profit Report":
     header("Profit Report", "Profit = Total Sales − Total Cost of Sales − Other Expenses.")
@@ -1871,11 +2110,18 @@ elif page == "Profit Report":
     cost_ok = sold_m is not None and not sold_m.empty
     cost = float(sold_m["cost_of_sales"].sum()) if cost_ok else 0.0
 
-    # Total Sales
+    # Total Sales: sum of the Daily Sales of the month; otherwise the Monthly Sales total
+    daily_all = read_table("DailySales")
+    d_hit = daily_all[daily_all["month_key"] == mk]
     sales_all = read_table("Sales")
     s_hit = sales_all[sales_all["month_key"] == mk]
-    sales_ok = not s_hit.empty
-    sales = float(s_hit.iloc[-1]["total_sales"]) if sales_ok else 0.0
+    sales_from_daily = not d_hit.empty
+    if sales_from_daily:
+        sales_ok = True
+        sales = float(d_hit["amount"].sum())
+    else:
+        sales_ok = not s_hit.empty
+        sales = float(s_hit.iloc[-1]["total_sales"]) if sales_ok else 0.0
 
     # Other Expenses
     exp_all = read_table("Expenses")
@@ -1886,8 +2132,13 @@ elif page == "Profit Report":
     profit = sales - cost - other_total
 
     if not sales_ok:
-        st.warning(f"Total sales for {month_label(mk)} are not entered yet (Monthly Sales section). "
+        st.warning(f"Total sales for {month_label(mk)} are not entered yet (Daily Sales or Monthly Sales section). "
                    "Total Sales is shown as 0.")
+    elif sales_from_daily:
+        by_t = d_hit.groupby("payment_type")["amount"].sum()
+        st.info(f"Total Sales is the sum of the Daily Sales of {month_label(mk)}: "
+                f"Cash {money(by_t.get('Cash', 0.0))} + Card {money(by_t.get('Card', 0.0))} "
+                f"+ QR {money(by_t.get('QR', 0.0))}.")
     if not cost_ok:
         st.warning(f"Total Cost of Sales for {month_label(mk)} cannot be calculated yet. Stock entries for "
                    f"{month_label(previous_month(mk))} and {month_label(mk)} are needed. Cost of Sales is shown as 0.")
