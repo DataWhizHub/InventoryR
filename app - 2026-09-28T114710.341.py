@@ -21,7 +21,7 @@ from gspread.utils import rowcol_to_a1
 #   Purchases         : purchases of the month (from previous month's stock items)
 #   Sold Quantity     : Sold = Previous month stock + Purchases - This month stock
 #   Other Expenses    : expenses with Date, Expense Type, Total Rs (editable / deletable)
-#   Monthly Sales     : Date + Cash + Card + QR payments of the month (Total = sum)
+#   Monthly Sales     : one record per DATE with Cash + Card + QR payments (Total = sum)
 #   Profit Report     : Profit = Total Sales - Total Cost of Sales - Other Expenses
 #   Settings          : users, items (code + main category), password, data import
 #
@@ -409,8 +409,10 @@ def save_expenses(month_key, rows, entered_by):
 
 def save_monthly_sales(month_key, sale_date, cash, card, qr, entered_by):
     """
-    One row per month: Date + Cash + Card + QR payments. total_sales (= the sum) is what the Profit Report uses.
-    Update the row if the month exists, otherwise add a new row.
+    One row per DATE: Date + Cash + Card + QR payments. total_sales (= the sum) of every date of a
+    month is added together by the Profit Report.
+    If a record for the same date already exists it is updated, otherwise a new row is added
+    (records of other dates are never touched).
     sale_date: ISO text (YYYY-MM-DD).
     """
     ws = get_worksheets()["Sales"]
@@ -419,7 +421,8 @@ def save_monthly_sales(month_key, sale_date, cash, card, qr, entered_by):
     cash, card, qr = float(cash), float(card), float(qr)
     total = cash + card + qr
     for i, r in enumerate(values[1:], start=2):
-        if len(r) >= 2 and r[0] != "" and r[1] == month_key:
+        r_date = r[8].strip() if len(r) > 8 else ""
+        if len(r) >= 2 and r[0] != "" and r[1] == month_key and r_date == sale_date:
             # columns C..I = total_sales, entered_by, updated_at, cash_sales, card_sales, qr_sales, sale_date
             ws.batch_update([{"range": f"C{i}:I{i}",
                               "values": [[total, entered_by, now, cash, card, qr, sale_date]]}],
@@ -1759,13 +1762,15 @@ elif page == "Other Expenses":
 
 
 # ============================================================
-# MONTHLY SALES  (Date + Cash + Card + QR payments of a month)
-#   Delete option: pick one saved month and delete its sales entry
+# MONTHLY SALES  (one record per DATE: Cash + Card + QR payments)
+#   Every saved date stays in the table; the Profit Report adds up all dates of the month.
+#   Selecting a new date gives empty entry boxes; selecting a saved date shows its values for editing.
+#   Delete option: pick one saved record and delete it
 # ============================================================
 elif page == "Monthly Sales":
     header("Total Monthly Sale",
-           "Enter the date and the sales of the month by payment type (Cash, Card, QR). "
-           "The total is used in the Profit Report.")
+           "Select a date and enter the sales of that day by payment type (Cash, Card, QR). "
+           "Each date is saved as its own record; the Profit Report uses the total of all dates in the month.")
     show_flash("sales_flash")
 
     mk = month_picker("Sales month", "msale")
@@ -1774,74 +1779,74 @@ elif page == "Monthly Sales":
     last_day = date(y, m, calendar.monthrange(y, m)[1])
 
     sales_all = read_table("Sales")
-    hit = sales_all[sales_all["month_key"] == mk]
-    ex_date = None
-    if hit.empty:
-        ex_cash = ex_card = ex_qr = ex_total = 0.0
-    else:
-        last = hit.iloc[-1]
-        ex_cash, ex_card, ex_qr = float(last["cash_sales"]), float(last["card_sales"]), float(last["qr_sales"])
-        ex_total = float(last["total_sales"])
-        d_parsed = pd.to_datetime(str(last["sale_date"]).strip(), errors="coerce")
-        if pd.notna(d_parsed) and first_day <= d_parsed.date() <= last_day:
-            ex_date = d_parsed.date()
+    month_sales = sales_all[sales_all["month_key"] == mk]
+    month_total = float(month_sales["total_sales"].sum())
 
-    # default date: the saved date, otherwise today (if inside the month) or the 1st of the month
+    # default date: today (if inside the month) or the 1st of the month
     today = date.today()
-    default_date = ex_date or (today if first_day <= today <= last_day else first_day)
+    default_date = today if first_day <= today <= last_day else first_day
 
     st.session_state.setdefault("sales_ver", 0)
-    if hit.empty:
-        st.caption(f"No sales saved for {month_label(mk)} yet.")
-    elif ex_total > 0 and (ex_cash + ex_card + ex_qr) == 0:
-        st.warning(f"The total sales of {month_label(mk)} ({money(ex_total)}) were saved before the Cash / Card / QR "
-                   "split existed. Enter the three amounts below and save to replace that total.")
+
+    # The date is chosen OUTSIDE the form so the entry boxes refresh as soon as another date is selected.
+    d1, _ = st.columns([1, 3])
+    s_date = d1.date_input("Date", value=default_date, min_value=first_day, max_value=last_day,
+                           key=f"sales_date_{mk}")
+    date_txt = s_date.isoformat()
+
+    # record already saved for this date (if any)
+    day_hit = month_sales[month_sales["sale_date"].astype(str).str.strip() == date_txt]
+    if day_hit.empty:
+        ex_cash = ex_card = ex_qr = None  # new date -> empty boxes
+        st.caption(f"No sales saved for {date_txt} yet.")
     else:
-        st.caption(f"Sales of {month_label(mk)} are already saved ({money(ex_total)}). "
-                   "Saving again updates these values.")
+        last = day_hit.iloc[-1]
+        ex_cash, ex_card, ex_qr = float(last["cash_sales"]), float(last["card_sales"]), float(last["qr_sales"])
+        st.caption(f"Sales of {date_txt} are already saved ({money(last['total_sales'])}). "
+                   "Saving again updates this date only.")
 
     with st.form("sales_form"):
         v = st.session_state["sales_ver"]
-        d1, _ = st.columns([1, 3])
-        s_date = d1.date_input("Date", value=default_date, min_value=first_day, max_value=last_day,
-                               key=f"sales_date_{mk}_{v}")
         s1, s2, s3 = st.columns(3)
         cash = s1.number_input("Cash Sales (Rs)", min_value=0.0, value=ex_cash, step=100.0, format="%.2f",
-                               key=f"sales_cash_{mk}_{v}")
+                               placeholder="0.00", key=f"sales_cash_{date_txt}_{v}")
         card = s2.number_input("Card Sales (Rs)", min_value=0.0, value=ex_card, step=100.0, format="%.2f",
-                               key=f"sales_card_{mk}_{v}")
+                               placeholder="0.00", key=f"sales_card_{date_txt}_{v}")
         qr = s3.number_input("QR Payments (Rs)", min_value=0.0, value=ex_qr, step=100.0, format="%.2f",
-                             key=f"sales_qr_{mk}_{v}")
+                             placeholder="0.00", key=f"sales_qr_{date_txt}_{v}")
         save_clicked = st.form_submit_button("Save Sales", type="primary")
 
     if save_clicked:
+        cash, card, qr = float(cash or 0.0), float(card or 0.0), float(qr or 0.0)
         total = cash + card + qr
         if total <= 0:
             st.error("Enter at least one amount (Cash, Card or QR) greater than zero.")
         else:
-            save_monthly_sales(mk, s_date.isoformat(), cash, card, qr, user["username"])
+            save_monthly_sales(mk, date_txt, cash, card, qr, user["username"])
             st.session_state["sales_ver"] += 1
             st.session_state["sales_flash"] = (
-                f"Sales of {month_label(mk)} saved ({s_date.isoformat()}): Cash {money(cash)} + Card {money(card)} "
+                f"Sales of {date_txt} saved: Cash {money(cash)} + Card {money(card)} "
                 f"+ QR {money(qr)} = Total {money(total)}.")
             st.rerun()
 
-    if not hit.empty:
+    if not month_sales.empty:
         st.markdown(
-            f'<div class="card kpi-green"><div class="kpi-label">Total Sales - {month_label(mk)}</div>'
-            f'<div class="kpi-value">{money(ex_total)}</div></div>',
+            f'<div class="card kpi-green"><div class="kpi-label">Total Sales - {month_label(mk)} '
+            f'({len(month_sales)} record{"" if len(month_sales) == 1 else "s"})</div>'
+            f'<div class="kpi-value">{money(month_total)}</div></div>',
             unsafe_allow_html=True
         )
 
-    st.markdown('<div class="section-title">Saved Monthly Sales</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Saved Sales Records</div>', unsafe_allow_html=True)
     if sales_all.empty:
-        st.info("No monthly sales saved yet.")
+        st.info("No sales saved yet.")
     else:
-        hist = sales_all.sort_values("month_key", ascending=False).copy()
-        hist["Month"] = hist["month_key"].map(month_label)
+        hist = sales_all.copy()
         hist["Date"] = hist["sale_date"].astype(str).str.strip()
+        hist["Month"] = hist["month_key"].map(month_label)
+        hist = hist.sort_values(["month_key", "Date", "updated_at"], ascending=False)
         st.dataframe(
-            hist[["Month", "Date", "cash_sales", "card_sales", "qr_sales", "total_sales", "entered_by", "updated_at"]].rename(columns={
+            hist[["Date", "Month", "cash_sales", "card_sales", "qr_sales", "total_sales", "entered_by", "updated_at"]].rename(columns={
                 "cash_sales": "Cash (Rs)", "card_sales": "Card (Rs)", "qr_sales": "QR (Rs)",
                 "total_sales": "Total Sales (Rs)", "entered_by": "Entered By", "updated_at": "Updated At"}),
             use_container_width=True, hide_index=True,
@@ -1853,28 +1858,28 @@ elif page == "Monthly Sales":
             },
         )
 
-        # ---------------- DELETE A MONTHLY SALES ENTRY ----------------
-        with st.expander("🗑️ Delete a monthly sales entry"):
+        # ---------------- DELETE A SALES RECORD ----------------
+        with st.expander("🗑️ Delete a sales record"):
             sales_labels = {
-                r["id"]: f'{month_label(r["month_key"])} • Cash {money(r["cash_sales"])} • '
+                r["id"]: f'{r["Date"] or month_label(r["month_key"])} • Cash {money(r["cash_sales"])} • '
                          f'Card {money(r["card_sales"])} • QR {money(r["qr_sales"])} • '
                          f'Total {money(r["total_sales"])}'
                 for _, r in hist.iterrows()
             }
             del_sales_id = st.selectbox(
-                "Sales entry", list(sales_labels.keys()), format_func=lambda x: sales_labels[x],
+                "Sales record", list(sales_labels.keys()), format_func=lambda x: sales_labels[x],
                 key=f"del_sales_{st.session_state['sales_ver']}")
             if st.button("Delete Entry", key="del_sales_btn"):
                 delete_row("Sales", del_sales_id)
                 st.session_state["sales_ver"] += 1
-                st.session_state["sales_flash"] = f"Sales entry deleted: {sales_labels[del_sales_id]}."
+                st.session_state["sales_flash"] = f"Sales record deleted: {sales_labels[del_sales_id]}."
                 st.rerun()
 
 
 # ============================================================
 # PROFIT REPORT
 #   Profit = Total Sales - Total Cost of Sales - Other Expenses
-#   Total Sales = the Monthly Sales total of the month (Cash + Card + QR).
+#   Total Sales = the total of ALL saved sales records (dates) of the month (Cash + Card + QR).
 # ============================================================
 elif page == "Profit Report":
     header("Profit Report", "Profit = Total Sales − Total Cost of Sales − Other Expenses.")
@@ -1889,11 +1894,11 @@ elif page == "Profit Report":
     cost_ok = sold_m is not None and not sold_m.empty
     cost = float(sold_m["cost_of_sales"].sum()) if cost_ok else 0.0
 
-    # Total Sales: the Monthly Sales total of the month
+    # Total Sales: the total of all sales records (dates) of the month
     sales_all = read_table("Sales")
     s_hit = sales_all[sales_all["month_key"] == mk]
     sales_ok = not s_hit.empty
-    sales = float(s_hit.iloc[-1]["total_sales"]) if sales_ok else 0.0
+    sales = float(s_hit["total_sales"].sum()) if sales_ok else 0.0
 
     # Other Expenses
     exp_all = read_table("Expenses")
@@ -1907,10 +1912,10 @@ elif page == "Profit Report":
         st.warning(f"Total sales for {month_label(mk)} are not entered yet (Monthly Sales section). "
                    "Total Sales is shown as 0.")
     else:
-        last_s = s_hit.iloc[-1]
-        st.info(f"Total Sales is taken from Monthly Sales of {month_label(mk)}: "
-                f"Cash {money(last_s['cash_sales'])} + Card {money(last_s['card_sales'])} "
-                f"+ QR {money(last_s['qr_sales'])}.")
+        st.info(f"Total Sales is the total of {len(s_hit)} sales record{'' if len(s_hit) == 1 else 's'} "
+                f"of {month_label(mk)}: "
+                f"Cash {money(s_hit['cash_sales'].sum())} + Card {money(s_hit['card_sales'].sum())} "
+                f"+ QR {money(s_hit['qr_sales'].sum())}.")
     if not cost_ok:
         st.warning(f"Total Cost of Sales for {month_label(mk)} cannot be calculated yet. Stock entries for "
                    f"{month_label(previous_month(mk))} and {month_label(mk)} are needed. Cost of Sales is shown as 0.")
