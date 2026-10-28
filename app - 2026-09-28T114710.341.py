@@ -73,6 +73,9 @@ section[data-testid="stSidebar"] button:hover { background: #334766 !important; 
 
 /* ---- Profit report table ---- */
 .pl-title { font-size: 1.25rem; font-weight: 800; color: #172033; margin: 6px 0 10px 0; }
+.pl-scroll { max-width: 640px; max-height: 420px; overflow-y: auto; overflow-x: auto;
+             border: 1px solid #cbd5e1; border-radius: 8px; }
+.pl-scroll .pl-table { max-width: none; }
 .pl-table { width: 100%; max-width: 640px; border-collapse: collapse; }
 .pl-table td { border: 1px solid #cbd5e1; padding: 9px 14px; color: #162033; background: #ffffff; }
 .pl-table td.amt { text-align: right; white-space: nowrap; }
@@ -82,6 +85,8 @@ section[data-testid="stSidebar"] button:hover { background: #334766 !important; 
 .pl-table tr.profit td { background: #e8eef7; font-weight: 800; font-size: 1.08rem; }
 .pl-table tr.profit td.pos { color: #15803d; }
 .pl-table tr.profit td.neg { color: #dc2626; }
+/* keep the Profit row visible at the bottom while scrolling */
+.pl-table tr.profit td { position: sticky; bottom: 0; }
 
 div[data-baseweb="input"] > div, div[data-baseweb="select"] > div, textarea { border-radius: 8px !important; }
 [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
@@ -1146,12 +1151,58 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-menu = ["Stock Entry", "Purchases", "Sold Quantity", "Other Expenses", "Monthly Sales",
-        "Profit Report"]
-if is_admin:
-    menu.append("Settings")
+# ---- Sidebar navigation: grouped sections + highlighted active page ----
+st.sidebar.markdown("""
+<style>
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] { margin-bottom: -6px; }
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button {
+    width: 100%; justify-content: flex-start; text-align: left;
+    background: transparent !important; border: 1px solid transparent !important;
+    border-radius: 8px; padding: 0.45rem 0.8rem; box-shadow: none; font-weight: 500;
+}
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button p,
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button div {
+    color: #dbe7f3 !important; text-align: left; font-size: 0.92rem;
+}
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button:hover {
+    background: rgba(255,255,255,0.10) !important; border: 1px solid rgba(255,255,255,0.18) !important;
+}
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button[kind="primary"],
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button[data-testid="stBaseButton-primary"] {
+    background: #1f77d0 !important; border: 1px solid #4a97e3 !important;
+}
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button[kind="primary"] p,
+section[data-testid="stSidebar"] [class*="st-key-nav_btn_"] button[data-testid="stBaseButton-primary"] p {
+    color: #ffffff !important; font-weight: 600;
+}
+</style>
+""", unsafe_allow_html=True)
 
-page = st.sidebar.radio("MENU", menu)
+NAV_PAGES = ["Stock Entry", "Purchases", "Sold Quantity", "Other Expenses", "Monthly Sales",
+             "Profit Report"]
+if is_admin:
+    NAV_PAGES.append("Settings")
+
+_valid_pages = NAV_PAGES
+if st.session_state.get("_nav_page") not in _valid_pages:
+    st.session_state["_nav_page"] = _valid_pages[0]
+
+
+def _switch_page(target):
+    st.session_state["_nav_page"] = target
+
+
+for _p in NAV_PAGES:
+    st.sidebar.button(
+        _p,
+        key="nav_btn_" + _p.replace(" ", "_"),
+        use_container_width=True,
+        type="primary" if st.session_state["_nav_page"] == _p else "secondary",
+        on_click=_switch_page,
+        args=(_p,),
+    )
+
+page = st.session_state["_nav_page"]
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh data", use_container_width=True):
     read_table.clear()
@@ -1937,7 +1988,7 @@ elif page == "Profit Report":
 
     st.markdown(
         f'<div class="pl-title">{html.escape(title)}</div>'
-        f'<table class="pl-table"><tbody>{rows_html}</tbody></table>',
+        f'<div class="pl-scroll"><table class="pl-table"><tbody>{rows_html}</tbody></table></div>',
         unsafe_allow_html=True
     )
 
