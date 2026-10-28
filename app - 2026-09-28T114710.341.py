@@ -52,8 +52,6 @@ section[data-testid="stSidebar"] button {
     color: #ffffff !important; background: #263754 !important; border: 1px solid #3b4d6b !important;
 }
 section[data-testid="stSidebar"] button:hover { background: #334766 !important; }
-.nav-logo { display: flex; justify-content: center; align-items: center; padding: 2px 0 10px 0; }
-.nav-logo img { max-width: 70%; max-height: 90px; height: auto; object-fit: contain; }
 .sidebar-brand { font-size: 1.35rem; font-weight: 800; color: #ffffff !important; margin: 0 0 2px 0; }
 .sidebar-sub { color: #9fb0ca !important; font-size: .76rem; margin-bottom: 1rem; }
 .user-chip { background: #202d43; border: 1px solid #30415d; border-radius: 10px; padding: 10px 12px; margin: 8px 0 15px 0; }
@@ -1143,30 +1141,6 @@ if "user" not in st.session_state:
 # ------------------------- SIDEBAR --------------------------
 user = st.session_state.user
 is_admin = user["role"] == "Admin"
-
-# Logo at the top centre of the sidebar. The file must sit in the same folder as this app
-# (e.g. the GitHub repo root). If it is missing, nothing is shown and the sidebar is unaffected.
-SIDEBAR_LOGO_FILE = "Kico.png"
-
-
-def _sidebar_logo_html():
-    import base64
-    import os
-    try:
-        base = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base, SIDEBAR_LOGO_FILE)
-        if os.path.isfile(path) and os.path.getsize(path) <= 5 * 1024 * 1024:
-            with open(path, "rb") as fh:
-                b64 = base64.b64encode(fh.read()).decode("ascii")
-            return f"<div class='nav-logo'><img src='data:image/png;base64,{b64}' alt='Kico'></div>"
-    except OSError:
-        pass
-    return ""
-
-
-_logo_html = _sidebar_logo_html()
-if _logo_html:
-    st.sidebar.markdown(_logo_html, unsafe_allow_html=True)
 
 st.sidebar.markdown('<div class="sidebar-brand">🍽️ Kico Foods Family Restaurant</div>', unsafe_allow_html=True)
 st.sidebar.markdown('<div class="sidebar-sub">Inventory & Sold Quantity</div>', unsafe_allow_html=True)
