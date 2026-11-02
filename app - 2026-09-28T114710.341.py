@@ -901,6 +901,7 @@ def build_expenses_report_pdf(title, cost_by_category, expenses, categories=None
         <Category> - Cost of Sales
             <expense type of that category, e.g. "Other Bakery Items">
         Total - <Category>          (= Cost of Sales + its other expenses)
+                                    (this Total row is shown ONLY when the category has other expenses)
     Expense types that do not belong to any Main Category are listed in a last block.
     The last row is Total Expenses (all blocks added together).
 
@@ -973,20 +974,21 @@ def build_expenses_report_pdf(title, cost_by_category, expenses, categories=None
         block_total = cost
         data.append([f"{disp} - Cost of Sales", n2(cost)])
         bold_rows.append(len(data) - 1)
-        for ename, eamt in sorted(by_cat.get(ck, []), key=lambda x: x[0].lower()):
+        cat_expenses = by_cat.get(ck, [])
+        for ename, eamt in sorted(cat_expenses, key=lambda x: x[0].lower()):
             data.append([ename, n2(eamt)])
             indent_rows.append(len(data) - 1)
             block_total += eamt
-        data.append([f"Total - {disp}", n2(block_total)])
-        total_rows.append(len(data) - 1)
+        # the "Total - <Category>" row is shown only when the category has other expenses
+        if cat_expenses:
+            data.append([f"Total - {disp}", n2(block_total)])
+            total_rows.append(len(data) - 1)
         grand += block_total
 
-    # cost of sales of items without any Main Category
+    # cost of sales of items without any Main Category (no other expenses -> no Total row)
     if "" in cost_map and abs(cost_map[""][1]) > 0:
         data.append(["(No category) - Cost of Sales", n2(cost_map[""][1])])
         bold_rows.append(len(data) - 1)
-        data.append(["Total - (No category)", n2(cost_map[""][1])])
-        total_rows.append(len(data) - 1)
         grand += cost_map[""][1]
 
     # expense types that belong to no Main Category
@@ -1699,9 +1701,13 @@ elif page == "Sold Quantity":
             if view.empty:
                 st.info("No sold quantity data for this selection.")
             else:
-                trend = view.groupby("month_key", as_index=False)["sold_qty"].sum().sort_values("month_key")
+                # sold quantity AND cost of sales per month (cost of sales is shown in brackets on the graph)
+                trend = view.groupby("month_key", as_index=False)[["sold_qty", "cost_of_sales"]] \
+                    .sum().sort_values("month_key")
                 trend["Month"] = pd.to_datetime(trend["month_key"] + "-01").dt.strftime("%b %Y")
-                trend = trend.rename(columns={"sold_qty": "Value"})
+                trend = trend.rename(columns={"sold_qty": "Value", "cost_of_sales": "Cost"})
+                # label shown on every point, e.g. 32.00 (Rs.32,000)
+                trend["Label"] = [f"{v:,.2f} (Rs.{c:,.0f})" for v, c in zip(trend["Value"], trend["Cost"])]
 
                 total_qty = view["sold_qty"].sum()
                 k1, k2 = st.columns(2)
@@ -1729,11 +1735,13 @@ elif page == "Sold Quantity":
                     y=alt.Y("Value:Q", title="Quantity Sold"),
                 )
                 line = base_chart.mark_line(point=True, strokeWidth=3, color="#2563eb").encode(
-                    tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Value:Q", title="Quantity Sold", format=",.2f")],
+                    tooltip=[alt.Tooltip("Month:N"),
+                             alt.Tooltip("Value:Q", title="Quantity Sold", format=",.2f"),
+                             alt.Tooltip("Cost:Q", title="Cost of Sales (Rs.)", format=",.2f")],
                 )
-                # value shown on every point
+                # value shown on every point: Quantity Sold (Rs.Cost of Sales)
                 labels = base_chart.mark_text(dy=-14, fontSize=12, fontWeight="bold", color="#172033").encode(
-                    text=alt.Text("Value:Q", format=",.2f"),
+                    text=alt.Text("Label:N"),
                 )
                 chart = (line + labels).properties(height=400, padding={"top": 24, "right": 12, "left": 5, "bottom": 5}) \
                     .configure(background="#ffffff") \
@@ -1788,7 +1796,8 @@ elif page == "Sold Quantity":
 #   Table of the selected month at the bottom: edit cells, delete rows, Save Changes
 #   Delete option: pick one expense entry and delete it
 #   Expenses Report (PDF): one table - every Main Category with its Cost of Sales + its own
-#   "Other <Category>" expenses, category total, and Total Expenses
+#   "Other <Category>" expenses, category total (only when the category has other expenses),
+#   and Total Expenses
 # ============================================================
 elif page == "Other Expenses":
     header("Other Expenses",
@@ -1961,7 +1970,7 @@ elif page == "Other Expenses":
 
     # ---------------- EXPENSES REPORT (PDF) ----------------
     # One table: every Main Category with its Cost of Sales + its own "Other <Category>" expenses,
-    # the category total, and the Total Expenses of the month.
+    # the category total (only when the category has other expenses), and the Total Expenses of the month.
     st.markdown(f'<div class="section-title">Expenses Report - {month_label(mk)}</div>', unsafe_allow_html=True)
 
     sold_rep = compute_sold_data()
@@ -1984,8 +1993,8 @@ elif page == "Other Expenses":
 
     st.caption("One table: each Main Category shows its Cost of Sales and its own Other expenses "
                "(an expense type is linked to a category when the category name is in it, e.g. "
-               "'Other Bakery Items' → 'Bakery Items'), then the category total. "
-               "Expenses of no category are listed last, followed by the Total Expenses.")
+               "'Other Bakery Items' → 'Bakery Items'), then the category total (only when the category "
+               "has other expenses). Expenses of no category are listed last, followed by the Total Expenses.")
 
     exp_report_title = f"Expenses Report - {calendar.month_name[m]} {y}"
     try:
@@ -2072,6 +2081,25 @@ elif page == "Monthly Sales":
             f'<div class="kpi-value">{money(month_total)}</div></div>',
             unsafe_allow_html=True
         )
+
+        # Cash / Card / QR totals of the month, shown separately after the Total Sales card
+        month_cash = float(month_sales["cash_sales"].sum())
+        month_card = float(month_sales["card_sales"].sum())
+        month_qr = float(month_sales["qr_sales"].sum())
+        st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+        p1, p2, p3 = st.columns(3)
+        for col, (label, value, cls) in zip(
+            [p1, p2, p3],
+            [(f"Cash Sales - {month_label(mk)}", month_cash, "kpi-blue"),
+             (f"Card Sales - {month_label(mk)}", month_card, "kpi-orange"),
+             (f"QR Payments - {month_label(mk)}", month_qr, "kpi-green")]
+        ):
+            with col:
+                st.markdown(
+                    f'<div class="card {cls}"><div class="kpi-label">{label}</div>'
+                    f'<div class="kpi-value">{money(value)}</div></div>',
+                    unsafe_allow_html=True
+                )
 
     st.markdown('<div class="section-title">Saved Sales Records</div>', unsafe_allow_html=True)
     if sales_all.empty:
