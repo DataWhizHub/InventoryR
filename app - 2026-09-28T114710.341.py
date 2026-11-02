@@ -894,6 +894,98 @@ def build_profit_report_pdf(title, sales, cost, expenses, profit):
     return buf.getvalue()
 
 
+def build_expenses_report_pdf(title, cost_by_category, expenses):
+    """
+    Expenses Report PDF (portrait A4) for one month.
+    cost_by_category: list of (main_category, cost_of_sales)
+    expenses: list of (expense_type, amount)  -> every expense type is shown ONCE with its total
+    Total Expenses = Total Cost of Sales + Total Other Expenses.
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    def n2(x):
+        return f"{float(x):,.2f}"
+
+    # ---- expense types: same type (any spelling in upper/lower case) = one row ----
+    type_totals = {}
+    for t, a in expenses:
+        name = str(t).strip()
+        key = name.lower()
+        if key in type_totals:
+            type_totals[key][1] += float(a)
+        else:
+            type_totals[key] = [name, float(a)]
+    expense_rows = [(name, total) for name, total in type_totals.values()]
+
+    total_cost = sum(float(v) for _, v in cost_by_category)
+    total_other = sum(v for _, v in expense_rows)
+    total_all = total_cost + total_other
+
+    def make_table(head, rows, total_label, total_value):
+        data = [head] + [[n, n2(v)] for n, v in rows]
+        if not rows:
+            data.append(["(none)", n2(0)])
+        data.append([total_label, n2(total_value)])
+        last = len(data) - 1
+        t = Table(data, colWidths=[300, 150], repeatRows=1)
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef7")),
+            ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#e8eef7")),
+            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        return t
+
+    cost_rows = [((c if str(c).strip() else "(No category)"), v) for c, v in cost_by_category]
+
+    # ---- summary table ----
+    summary = Table(
+        [["Total Cost of Sales", n2(total_cost)],
+         ["Total Other Expenses", n2(total_other)],
+         ["Total Expenses", n2(total_all)]],
+        colWidths=[300, 150])
+    summary.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#e8eef7")),
+        ("FONTSIZE", (0, 2), (-1, 2), 11),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("et", parent=styles["Heading2"], alignment=1)
+    sub_style = ParagraphStyle("es", parent=styles["Heading4"], spaceBefore=6, spaceAfter=4)
+
+    story = [
+        Paragraph(html.escape(title), title_style), Spacer(1, 10),
+        Paragraph("Cost of Sales - Main Category wise", sub_style),
+        make_table(["Main Category", "Cost of Sales (Rs.)"], cost_rows, "Total Cost of Sales", total_cost),
+        Spacer(1, 16),
+        Paragraph("Other Expenses - Expense Type wise", sub_style),
+        make_table(["Expense Type", "Total (Rs.)"], expense_rows, "Total Other Expenses", total_other),
+        Spacer(1, 16),
+        Paragraph("Total Expenses", sub_style),
+        summary,
+    ]
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=60, rightMargin=60,
+                            topMargin=50, bottomMargin=50, title=title)
+    doc.build(story)
+    return buf.getvalue()
+
+
 # ------------------------- DATA IMPORT ----------------------
 MONTH_NUM = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 BLOCK_RE = re.compile(r"(opening stock|closing stock|purchases)\s*\(\s*([a-z]+)\s+(\d{4})\s*\)", re.I)
@@ -1641,6 +1733,7 @@ elif page == "Sold Quantity":
 #   Add: Date + Expense Type (typed, with suggestions of old types) + Total
 #   Table of the selected month at the bottom: edit cells, delete rows, Save Changes
 #   Delete option: pick one expense entry and delete it
+#   Expenses Report (PDF): Main Category-wise Cost of Sales + expense type totals + Total Expenses
 # ============================================================
 elif page == "Other Expenses":
     header("Other Expenses",
@@ -1810,6 +1903,39 @@ elif page == "Other Expenses":
                 st.session_state["exp_ver"] += 1
                 st.session_state["exp_flash"] = f"Expense deleted: {exp_labels[del_exp_id]}."
                 st.rerun()
+
+    # ---------------- EXPENSES REPORT (PDF) ----------------
+    # Main Category-wise Total Cost of Sales + Other Expenses (each expense type) + Total Expenses
+    st.markdown(f'<div class="section-title">Expenses Report - {month_label(mk)}</div>', unsafe_allow_html=True)
+
+    sold_rep = compute_sold_data()
+    sold_rep_m = sold_rep[sold_rep["month_key"] == mk] if sold_rep is not None else None
+    rep_cost_ok = sold_rep_m is not None and not sold_rep_m.empty
+    if rep_cost_ok:
+        cat_cost = sold_rep_m.copy()
+        cat_cost["category"] = cat_cost["category"].astype(str).str.strip()
+        cost_by_category = [(str(c), float(v)) for c, v in
+                            cat_cost.groupby("category")["cost_of_sales"].sum().sort_index().items()]
+    else:
+        cost_by_category = []
+        st.warning(f"Cost of Sales for {month_label(mk)} cannot be calculated yet (stock entries for "
+                   f"{month_label(previous_month(mk))} and {month_label(mk)} are needed). "
+                   "It is shown as 0 in the report.")
+
+    exp_report_rows = [(str(t), float(a)) for t, a in zip(
+        exp_all[exp_all["month_key"] == mk]["expense_type"],
+        exp_all[exp_all["month_key"] == mk]["amount"])]
+
+    st.caption("The report shows the Cost of Sales of every Main Category, the total of each Other Expense "
+               "type, and the Total Expenses of the selected month.")
+
+    exp_report_title = f"Expenses Report - {calendar.month_name[m]} {y}"
+    try:
+        exp_pdf = build_expenses_report_pdf(exp_report_title, cost_by_category, exp_report_rows)
+        st.download_button(f"📄 Download {exp_report_title} (PDF)", exp_pdf,
+                           f"expenses_report_{mk}.pdf", "application/pdf", key=f"exp_pdf_btn_{mk}")
+    except ImportError:
+        st.error("PDF export needs the `reportlab` package. Add `reportlab` to requirements.txt and reboot the app.")
 
 
 # ============================================================
