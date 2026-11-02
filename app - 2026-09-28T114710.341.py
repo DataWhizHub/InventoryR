@@ -894,12 +894,21 @@ def build_profit_report_pdf(title, sales, cost, expenses, profit):
     return buf.getvalue()
 
 
-def build_expenses_report_pdf(title, cost_by_category, expenses):
+def build_expenses_report_pdf(title, cost_by_category, expenses, categories=None):
     """
-    Expenses Report PDF (portrait A4) for one month.
-    cost_by_category: list of (main_category, cost_of_sales)
-    expenses: list of (expense_type, amount)  -> every expense type is shown ONCE with its total
-    Total Expenses = Total Cost of Sales + Total Other Expenses.
+    Expenses Report PDF (portrait A4) for one month - ONE table.
+    For every Main Category:
+        <Category> - Cost of Sales
+            <expense type of that category, e.g. "Other Bakery Items">
+        Total - <Category>          (= Cost of Sales + its other expenses)
+    Expense types that do not belong to any Main Category are listed in a last block.
+    The last row is Total Expenses (all blocks added together).
+
+    cost_by_category : list of (main_category, cost_of_sales)
+    expenses         : list of (expense_type, amount)
+    categories       : all Main Category names (used to link an expense type to its category:
+                       an expense type belongs to a category when the category name appears in it,
+                       e.g. "Other Bakery Items" -> "Bakery Items"; the longest matching name wins)
     """
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -909,7 +918,27 @@ def build_expenses_report_pdf(title, cost_by_category, expenses):
     def n2(x):
         return f"{float(x):,.2f}"
 
-    # ---- expense types: same type (any spelling in upper/lower case) = one row ----
+    # ---- Cost of Sales per Main Category ----
+    cost_map = {}  # lower-case category -> [display name, cost]
+    for c, v in cost_by_category:
+        name = str(c).strip()
+        key = name.lower()
+        if key in cost_map:
+            cost_map[key][1] += float(v)
+        else:
+            cost_map[key] = [name, float(v)]
+
+    # ---- all known category names (lower-case key -> display name); blank = no category ----
+    cat_names = {}
+    for c in (categories or []):
+        name = str(c).strip()
+        if name:
+            cat_names.setdefault(name.lower(), name)
+    for key, (name, _) in cost_map.items():
+        if key:
+            cat_names.setdefault(key, name)
+
+    # ---- total of each expense type (same type = one row, upper/lower case ignored) ----
     type_totals = {}
     for t, a in expenses:
         name = str(t).strip()
@@ -918,71 +947,96 @@ def build_expenses_report_pdf(title, cost_by_category, expenses):
             type_totals[key][1] += float(a)
         else:
             type_totals[key] = [name, float(a)]
-    expense_rows = [(name, total) for name, total in type_totals.values()]
 
-    total_cost = sum(float(v) for _, v in cost_by_category)
-    total_other = sum(v for _, v in expense_rows)
-    total_all = total_cost + total_other
+    # ---- link every expense type to its Main Category (longest category name found inside it) ----
+    by_cat = {}      # category key -> [(expense type, total)]
+    unlinked = []    # [(expense type, total)]
+    for key, (name, total) in type_totals.items():
+        best = None
+        for ck in cat_names:
+            if ck in key and (best is None or len(ck) > len(best)):
+                best = ck
+        if best is None:
+            unlinked.append((name, total))
+        else:
+            by_cat.setdefault(best, []).append((name, total))
 
-    def make_table(head, rows, total_label, total_value):
-        data = [head] + [[n, n2(v)] for n, v in rows]
-        if not rows:
-            data.append(["(none)", n2(0)])
-        data.append([total_label, n2(total_value)])
-        last = len(data) - 1
-        t = Table(data, colWidths=[300, 150], repeatRows=1)
-        t.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
-            ("FONTSIZE", (0, 0), (-1, -1), 10),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef7")),
-            ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#e8eef7")),
-            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        return t
+    # ---- build the single table ----
+    data = [["Description", "Amount (Rs.)"]]
+    bold_rows, total_rows, indent_rows = [], [], []
+    grand = 0.0
 
-    cost_rows = [((c if str(c).strip() else "(No category)"), v) for c, v in cost_by_category]
+    shown = set(k for k in cost_map if k) | set(by_cat.keys())
+    for ck in sorted(shown, key=lambda k: cat_names.get(k, k).lower()):
+        disp = cat_names.get(ck, ck)
+        cost = cost_map.get(ck, [disp, 0.0])[1]
+        block_total = cost
+        data.append([f"{disp} - Cost of Sales", n2(cost)])
+        bold_rows.append(len(data) - 1)
+        for ename, eamt in sorted(by_cat.get(ck, []), key=lambda x: x[0].lower()):
+            data.append([ename, n2(eamt)])
+            indent_rows.append(len(data) - 1)
+            block_total += eamt
+        data.append([f"Total - {disp}", n2(block_total)])
+        total_rows.append(len(data) - 1)
+        grand += block_total
 
-    # ---- summary table ----
-    summary = Table(
-        [["Total Cost of Sales", n2(total_cost)],
-         ["Total Other Expenses", n2(total_other)],
-         ["Total Expenses", n2(total_all)]],
-        colWidths=[300, 150])
-    summary.setStyle(TableStyle([
+    # cost of sales of items without any Main Category
+    if "" in cost_map and abs(cost_map[""][1]) > 0:
+        data.append(["(No category) - Cost of Sales", n2(cost_map[""][1])])
+        bold_rows.append(len(data) - 1)
+        data.append(["Total - (No category)", n2(cost_map[""][1])])
+        total_rows.append(len(data) - 1)
+        grand += cost_map[""][1]
+
+    # expense types that belong to no Main Category
+    if unlinked:
+        data.append(["Other Expenses (not linked to a Main Category)", ""])
+        bold_rows.append(len(data) - 1)
+        un_total = 0.0
+        for ename, eamt in sorted(unlinked, key=lambda x: x[0].lower()):
+            data.append([ename, n2(eamt)])
+            indent_rows.append(len(data) - 1)
+            un_total += eamt
+        data.append(["Total - Other Expenses", n2(un_total)])
+        total_rows.append(len(data) - 1)
+        grand += un_total
+
+    if len(data) == 1:
+        data.append(["(no cost of sales or expenses for this month)", n2(0)])
+
+    data.append(["Total Expenses", n2(grand)])
+    last = len(data) - 1
+
+    style = [
         ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#e8eef7")),
-        ("FONTSIZE", (0, 2), (-1, 2), 11),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef7")),
         ("ALIGN", (1, 0), (1, -1), "RIGHT"),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("et", parent=styles["Heading2"], alignment=1)
-    sub_style = ParagraphStyle("es", parent=styles["Heading4"], spaceBefore=6, spaceAfter=4)
-
-    story = [
-        Paragraph(html.escape(title), title_style), Spacer(1, 10),
-        Paragraph("Cost of Sales - Main Category wise", sub_style),
-        make_table(["Main Category", "Cost of Sales (Rs.)"], cost_rows, "Total Cost of Sales", total_cost),
-        Spacer(1, 16),
-        Paragraph("Other Expenses - Expense Type wise", sub_style),
-        make_table(["Expense Type", "Total (Rs.)"], expense_rows, "Total Other Expenses", total_other),
-        Spacer(1, 16),
-        Paragraph("Total Expenses", sub_style),
-        summary,
+        ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+        ("FONTSIZE", (0, last), (-1, last), 11),
+        ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#e8eef7")),
     ]
+    for r in bold_rows:
+        style.append(("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"))
+    for r in indent_rows:
+        style += [("LEFTPADDING", (0, r), (0, r), 26),
+                  ("TEXTCOLOR", (0, r), (-1, r), colors.HexColor("#4b5a70"))]
+    for r in total_rows:
+        style += [("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"),
+                  ("BACKGROUND", (0, r), (-1, r), colors.HexColor("#f1f5fb"))]
 
+    table = Table(data, colWidths=[330, 150], repeatRows=1)
+    table.setStyle(TableStyle(style))
+
+    title_style = ParagraphStyle("et", parent=getSampleStyleSheet()["Heading2"], alignment=1)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=60, rightMargin=60,
                             topMargin=50, bottomMargin=50, title=title)
-    doc.build(story)
+    doc.build([Paragraph(html.escape(title), title_style), Spacer(1, 12), table])
     return buf.getvalue()
 
 
@@ -1733,7 +1787,8 @@ elif page == "Sold Quantity":
 #   Add: Date + Expense Type (typed, with suggestions of old types) + Total
 #   Table of the selected month at the bottom: edit cells, delete rows, Save Changes
 #   Delete option: pick one expense entry and delete it
-#   Expenses Report (PDF): Main Category-wise Cost of Sales + expense type totals + Total Expenses
+#   Expenses Report (PDF): one table - every Main Category with its Cost of Sales + its own
+#   "Other <Category>" expenses, category total, and Total Expenses
 # ============================================================
 elif page == "Other Expenses":
     header("Other Expenses",
@@ -1905,7 +1960,8 @@ elif page == "Other Expenses":
                 st.rerun()
 
     # ---------------- EXPENSES REPORT (PDF) ----------------
-    # Main Category-wise Total Cost of Sales + Other Expenses (each expense type) + Total Expenses
+    # One table: every Main Category with its Cost of Sales + its own "Other <Category>" expenses,
+    # the category total, and the Total Expenses of the month.
     st.markdown(f'<div class="section-title">Expenses Report - {month_label(mk)}</div>', unsafe_allow_html=True)
 
     sold_rep = compute_sold_data()
@@ -1926,12 +1982,15 @@ elif page == "Other Expenses":
         exp_all[exp_all["month_key"] == mk]["expense_type"],
         exp_all[exp_all["month_key"] == mk]["amount"])]
 
-    st.caption("The report shows the Cost of Sales of every Main Category, the total of each Other Expense "
-               "type, and the Total Expenses of the selected month.")
+    st.caption("One table: each Main Category shows its Cost of Sales and its own Other expenses "
+               "(an expense type is linked to a category when the category name is in it, e.g. "
+               "'Other Bakery Items' → 'Bakery Items'), then the category total. "
+               "Expenses of no category are listed last, followed by the Total Expenses.")
 
     exp_report_title = f"Expenses Report - {calendar.month_name[m]} {y}"
     try:
-        exp_pdf = build_expenses_report_pdf(exp_report_title, cost_by_category, exp_report_rows)
+        exp_pdf = build_expenses_report_pdf(exp_report_title, cost_by_category, exp_report_rows,
+                                            category_list())
         st.download_button(f"📄 Download {exp_report_title} (PDF)", exp_pdf,
                            f"expenses_report_{mk}.pdf", "application/pdf", key=f"exp_pdf_btn_{mk}")
     except ImportError:
