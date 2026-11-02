@@ -22,7 +22,8 @@ from gspread.utils import rowcol_to_a1
 #   Sold Quantity     : Sold = Previous month stock + Purchases - This month stock
 #   Other Expenses    : expenses with Date, Expense Type, Total Rs (editable / deletable)
 #   Monthly Sales     : one record per DATE with Cash + Card + QR payments (Total = sum)
-#   Profit Report     : Profit = Total Sales - Total Cost of Sales - Other Expenses
+#   Profit Report     : Expenses Report + Sales (Cash, Card, QR, Total) + Profit
+#                       Profit = Total Sales - Total Expenses (Cost of Sales + Other Expenses)
 #   Settings          : users, items (code + main category), password, data import
 #
 #   Imported previous data keeps its own Total values (column total_value).
@@ -80,6 +81,8 @@ section[data-testid="stSidebar"] button:hover { background: #334766 !important; 
 .pl-table td { border: 1px solid #cbd5e1; padding: 9px 14px; color: #162033; background: #ffffff; }
 .pl-table td.amt { text-align: right; white-space: nowrap; }
 .pl-table tr.head td { background: #e8eef7; font-weight: 800; }
+.pl-table tr.cat td { background: #ffffff; font-weight: 700; }
+.pl-table tr.tot td { background: #f1f5fb; font-weight: 700; }
 .pl-table tr.sub td { color: #4b5a70; font-size: .92rem; background: #f8fafc; }
 .pl-table tr.sub td:first-child { padding-left: 34px; }
 .pl-table tr.profit td { background: #e8eef7; font-weight: 800; font-size: 1.08rem; }
@@ -834,12 +837,102 @@ def build_sales_report_pdf(rep, mk, prev_rep=None):
     return buf.getvalue()
 
 
-def build_profit_report_pdf(title, sales, cost, expenses, profit):
+def expense_report_lines(cost_by_category, expenses, categories=None):
     """
-    Profit Report PDF (portrait A4).
-    expenses: list of (expense_type, amount). Profit = Total Sales - Total Cost of Sales - Other Expenses.
-    Under "Other Expenses" every expense type is shown ONCE with its total
-    (several entries of the same type, e.g. on different dates, are added together).
+    Builds the rows of the Expenses Report (used by the Profit Report page and PDF).
+    Returns (lines, grand_total) where lines = list of (label, amount or None, kind) and
+    kind is one of:
+        "cat"   : "<Category> - Cost of Sales" row (bold)
+        "item"  : an expense type of that category (indented)
+        "total" : "Total - <Category>" row (only when the category has other expenses)
+        "group" : heading row without amount ("Other Expenses (not linked to a Main Category)")
+    grand_total = all Cost of Sales + all other expenses = "Total Expenses".
+    An expense type belongs to a category when the category name appears in it
+    (e.g. "Other Bakery Items" -> "Bakery Items"; the longest matching name wins).
+    """
+    # ---- Cost of Sales per Main Category ----
+    cost_map = {}  # lower-case category -> [display name, cost]
+    for c, v in cost_by_category:
+        name = str(c).strip()
+        key = name.lower()
+        if key in cost_map:
+            cost_map[key][1] += float(v)
+        else:
+            cost_map[key] = [name, float(v)]
+
+    # ---- all known category names (lower-case key -> display name) ----
+    cat_names = {}
+    for c in (categories or []):
+        name = str(c).strip()
+        if name:
+            cat_names.setdefault(name.lower(), name)
+    for key, (name, _) in cost_map.items():
+        if key:
+            cat_names.setdefault(key, name)
+
+    # ---- total of each expense type (same type = one row, upper/lower case ignored) ----
+    type_totals = {}
+    for t, a in expenses:
+        name = str(t).strip()
+        key = name.lower()
+        if key in type_totals:
+            type_totals[key][1] += float(a)
+        else:
+            type_totals[key] = [name, float(a)]
+
+    # ---- link every expense type to its Main Category ----
+    by_cat, unlinked = {}, []
+    for key, (name, total) in type_totals.items():
+        best = None
+        for ck in cat_names:
+            if ck in key and (best is None or len(ck) > len(best)):
+                best = ck
+        if best is None:
+            unlinked.append((name, total))
+        else:
+            by_cat.setdefault(best, []).append((name, total))
+
+    lines, grand = [], 0.0
+    shown = set(k for k in cost_map if k) | set(by_cat.keys())
+    for ck in sorted(shown, key=lambda k: cat_names.get(k, k).lower()):
+        disp = cat_names.get(ck, ck)
+        cost = cost_map.get(ck, [disp, 0.0])[1]
+        block_total = cost
+        lines.append((f"{disp} - Cost of Sales", cost, "cat"))
+        cat_expenses = by_cat.get(ck, [])
+        for ename, eamt in sorted(cat_expenses, key=lambda x: x[0].lower()):
+            lines.append((ename, eamt, "item"))
+            block_total += eamt
+        if cat_expenses:
+            lines.append((f"Total - {disp}", block_total, "total"))
+        grand += block_total
+
+    # cost of sales of items without any Main Category
+    if "" in cost_map and abs(cost_map[""][1]) > 0:
+        lines.append(("(No category) - Cost of Sales", cost_map[""][1], "cat"))
+        grand += cost_map[""][1]
+
+    # expense types that belong to no Main Category
+    if unlinked:
+        lines.append(("Other Expenses (not linked to a Main Category)", None, "group"))
+        un_total = 0.0
+        for ename, eamt in sorted(unlinked, key=lambda x: x[0].lower()):
+            lines.append((ename, eamt, "item"))
+            un_total += eamt
+        lines.append(("Total - Other Expenses", un_total, "total"))
+        grand += un_total
+
+    return lines, grand
+
+
+def build_profit_report_pdf(title, lines, total_expenses, cash, card, qr, sales, profit):
+    """
+    Profit Report PDF (portrait A4):
+        1. Expenses Report  (every Main Category: Cost of Sales + its other expenses, category totals,
+                             then Total Expenses)
+        2. Sales            (Cash Sales, Card Sales, QR Payments, Total Sales)
+        3. Profit           (= Total Sales - Total Expenses)
+    lines: rows from expense_report_lines()
     """
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -849,41 +942,64 @@ def build_profit_report_pdf(title, sales, cost, expenses, profit):
     def n2(x):
         return f"{float(x):,.2f}"
 
-    # ---- total of each expense type (same type = one row; first spelling / order is kept) ----
-    type_totals = {}   # lower-case type -> [display name, total]
-    for t, a in expenses:
-        name = str(t).strip()
-        key = name.lower()
-        if key in type_totals:
-            type_totals[key][1] += float(a)
-        else:
-            type_totals[key] = [name, float(a)]
-    expense_rows = [(name, total) for name, total in type_totals.values()]
+    data = [["Description", "Amount (Rs.)"]]
+    bold_rows, total_rows, indent_rows, head_rows = [], [], [], []
 
-    other_total = sum(a for _, a in expense_rows)
-    data = [["Total Sales", n2(sales)],
-            ["Total Cost of Sales", n2(cost)],
-            ["Other Expenses", n2(other_total)]]
-    for t, a in expense_rows:
-        data.append([t, n2(a)])
+    # ---- 1. Expenses Report ----
+    for label, amt, kind in lines:
+        data.append([label, "" if amt is None else n2(amt)])
+        r = len(data) - 1
+        if kind in ("cat", "group"):
+            bold_rows.append(r)
+        elif kind == "item":
+            indent_rows.append(r)
+        elif kind == "total":
+            total_rows.append(r)
+    if not lines:
+        data.append(["(no cost of sales or expenses for this month)", n2(0)])
+    data.append(["Total Expenses", n2(total_expenses)])
+    head_rows.append(len(data) - 1)
+
+    # ---- 2. Sales ----
+    data.append(["Cash Sales", n2(cash)])
+    indent_rows.append(len(data) - 1)
+    data.append(["Card Sales", n2(card)])
+    indent_rows.append(len(data) - 1)
+    data.append(["QR Payments", n2(qr)])
+    indent_rows.append(len(data) - 1)
+    data.append(["Total Sales", n2(sales)])
+    head_rows.append(len(data) - 1)
+
+    # ---- 3. Profit ----
     data.append(["Profit", n2(profit)])
     profit_row = len(data) - 1
 
     style = [
         ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
         ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("FONTNAME", (0, 0), (-1, 2), "Helvetica-Bold"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef7")),
         ("ALIGN", (1, 0), (1, -1), "RIGHT"),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("BACKGROUND", (0, 0), (-1, 2), colors.HexColor("#e8eef7")),
-        ("LEFTPADDING", (0, 3), (0, profit_row - 1), 26),
-        ("TEXTCOLOR", (0, 3), (-1, profit_row - 1), colors.HexColor("#4b5a70")),
+    ]
+    for r in bold_rows:
+        style.append(("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"))
+    for r in indent_rows:
+        style += [("LEFTPADDING", (0, r), (0, r), 26),
+                  ("TEXTCOLOR", (0, r), (-1, r), colors.HexColor("#4b5a70"))]
+    for r in total_rows:
+        style += [("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"),
+                  ("BACKGROUND", (0, r), (-1, r), colors.HexColor("#f1f5fb"))]
+    for r in head_rows:
+        style += [("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"),
+                  ("BACKGROUND", (0, r), (-1, r), colors.HexColor("#e8eef7"))]
+    style += [
         ("FONTNAME", (0, profit_row), (-1, profit_row), "Helvetica-Bold"),
         ("FONTSIZE", (0, profit_row), (-1, profit_row), 11),
         ("BACKGROUND", (0, profit_row), (-1, profit_row), colors.HexColor("#e8eef7")),
     ]
-    table = Table(data, colWidths=[300, 150])
+    table = Table(data, colWidths=[330, 150], repeatRows=1)
     table.setStyle(TableStyle(style))
 
     title_style = ParagraphStyle("pt", parent=getSampleStyleSheet()["Heading2"], alignment=1)
@@ -2142,35 +2258,48 @@ elif page == "Monthly Sales":
 
 # ============================================================
 # PROFIT REPORT
-#   Profit = Total Sales - Total Cost of Sales - Other Expenses
+#   Layout:  1. Expenses Report (Cost of Sales + Other Expenses per Main Category, Total Expenses)
+#            2. Sales (Cash Sales, Card Sales, QR Payments, Total Sales)
+#            3. Profit = Total Sales - Total Expenses
 #   Total Sales = the total of ALL saved sales records (dates) of the month (Cash + Card + QR).
 # ============================================================
 elif page == "Profit Report":
-    header("Profit Report", "Profit = Total Sales − Total Cost of Sales − Other Expenses.")
+    header("Profit Report", "Expenses Report + Sales (Cash, Card, QR) → Profit = Total Sales − Total Expenses.")
 
     mk = month_picker("Report month", "profit")
     month_name = calendar.month_name[int(mk[5:7])]
     title = f"Profit Report - {month_name} {mk[:4]}"
 
-    # Total Cost of Sales (from stock + purchases, same calculation as the Sold Quantity PDF)
+    # Cost of Sales per Main Category (from stock + purchases, same calculation as the Sold Quantity PDF)
     sold = compute_sold_data()
     sold_m = sold[sold["month_key"] == mk] if sold is not None else None
     cost_ok = sold_m is not None and not sold_m.empty
-    cost = float(sold_m["cost_of_sales"].sum()) if cost_ok else 0.0
+    if cost_ok:
+        cat_cost = sold_m.copy()
+        cat_cost["category"] = cat_cost["category"].astype(str).str.strip()
+        cost_by_category = [(str(c), float(v)) for c, v in
+                            cat_cost.groupby("category")["cost_of_sales"].sum().sort_index().items()]
+    else:
+        cost_by_category = []
 
-    # Total Sales: the total of all sales records (dates) of the month
+    # Sales: the totals of all sales records (dates) of the month
     sales_all = read_table("Sales")
     s_hit = sales_all[sales_all["month_key"] == mk]
     sales_ok = not s_hit.empty
+    sales_cash = float(s_hit["cash_sales"].sum()) if sales_ok else 0.0
+    sales_card = float(s_hit["card_sales"].sum()) if sales_ok else 0.0
+    sales_qr = float(s_hit["qr_sales"].sum()) if sales_ok else 0.0
     sales = float(s_hit["total_sales"].sum()) if sales_ok else 0.0
 
     # Other Expenses
     exp_all = read_table("Expenses")
     exp_m = exp_all[exp_all["month_key"] == mk]
     expenses = [(str(t), float(a)) for t, a in zip(exp_m["expense_type"], exp_m["amount"])]
-    other_total = sum(a for _, a in expenses)
 
-    profit = sales - cost - other_total
+    # Expenses Report rows + Total Expenses (= Cost of Sales + Other Expenses)
+    exp_lines, total_expenses = expense_report_lines(cost_by_category, expenses, category_list())
+
+    profit = sales - total_expenses
 
     if not sales_ok:
         st.warning(f"Total sales for {month_label(mk)} are not entered yet (Monthly Sales section). "
@@ -2178,8 +2307,7 @@ elif page == "Profit Report":
     else:
         st.info(f"Total Sales is the total of {len(s_hit)} sales record{'' if len(s_hit) == 1 else 's'} "
                 f"of {month_label(mk)}: "
-                f"Cash {money(s_hit['cash_sales'].sum())} + Card {money(s_hit['card_sales'].sum())} "
-                f"+ QR {money(s_hit['qr_sales'].sum())}.")
+                f"Cash {money(sales_cash)} + Card {money(sales_card)} + QR {money(sales_qr)}.")
     if not cost_ok:
         st.warning(f"Total Cost of Sales for {month_label(mk)} cannot be calculated yet. Stock entries for "
                    f"{month_label(previous_month(mk))} and {month_label(mk)} are needed. Cost of Sales is shown as 0.")
@@ -2189,13 +2317,24 @@ elif page == "Profit Report":
     def money_cell(v):
         return f"{float(v):,.2f}"
 
-    rows_html = (
-        f'<tr class="head"><td>Total Sales</td><td class="amt">{money_cell(sales)}</td></tr>'
-        f'<tr class="head"><td>Total Cost of Sales</td><td class="amt">{money_cell(cost)}</td></tr>'
-        f'<tr class="head"><td>Other Expenses</td><td class="amt">{money_cell(other_total)}</td></tr>'
-    )
-    for t, a in expenses:
-        rows_html += f'<tr class="sub"><td>{html.escape(t)}</td><td class="amt">{money_cell(a)}</td></tr>'
+    # ---- 1. Expenses Report ----
+    rows_html = ""
+    css_for = {"cat": "cat", "item": "sub", "total": "tot", "group": "cat"}
+    for label, amt, kind in exp_lines:
+        amt_html = "" if amt is None else money_cell(amt)
+        rows_html += f'<tr class="{css_for[kind]}"><td>{html.escape(label)}</td><td class="amt">{amt_html}</td></tr>'
+    if not exp_lines:
+        rows_html += (f'<tr class="sub"><td>(no cost of sales or expenses for this month)</td>'
+                      f'<td class="amt">{money_cell(0)}</td></tr>')
+    rows_html += f'<tr class="head"><td>Total Expenses</td><td class="amt">{money_cell(total_expenses)}</td></tr>'
+
+    # ---- 2. Sales ----
+    rows_html += f'<tr class="sub"><td>Cash Sales</td><td class="amt">{money_cell(sales_cash)}</td></tr>'
+    rows_html += f'<tr class="sub"><td>Card Sales</td><td class="amt">{money_cell(sales_card)}</td></tr>'
+    rows_html += f'<tr class="sub"><td>QR Payments</td><td class="amt">{money_cell(sales_qr)}</td></tr>'
+    rows_html += f'<tr class="head"><td>Total Sales</td><td class="amt">{money_cell(sales)}</td></tr>'
+
+    # ---- 3. Profit ----
     cls = "pos" if profit >= 0 else "neg"
     rows_html += f'<tr class="profit"><td>Profit</td><td class="amt {cls}">{money_cell(profit)}</td></tr>'
 
@@ -2206,7 +2345,8 @@ elif page == "Profit Report":
     )
 
     try:
-        pdf_bytes = build_profit_report_pdf(title, sales, cost, expenses, profit)
+        pdf_bytes = build_profit_report_pdf(title, exp_lines, total_expenses,
+                                            sales_cash, sales_card, sales_qr, sales, profit)
         st.download_button(f"📄 Download {title} (PDF)", pdf_bytes, f"profit_report_{mk}.pdf",
                            "application/pdf", key="profit_pdf_btn")
     except ImportError:
